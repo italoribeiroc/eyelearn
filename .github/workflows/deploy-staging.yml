@@ -60,9 +60,20 @@ jobs:
 
       - name: Validate Vercel token
         run: |
-          curl --fail --silent --show-error \
+          response_file="$(mktemp)"
+          status_code="$(curl --silent --show-error --write-out "%{http_code}" \
             --header "Authorization: Bearer $VERCEL_TOKEN" \
-            https://api.vercel.com/v2/user > /dev/null
+            --output "$response_file" \
+            https://api.vercel.com/v2/user)"
+
+          if [ "$status_code" -lt 200 ] || [ "$status_code" -ge 300 ]; then
+            echo "Vercel token validation failed with HTTP $status_code"
+            cat "$response_file"
+            exit 1
+          fi
+
+          echo "Vercel token validation succeeded with HTTP $status_code"
+          cat "$response_file"
 
       - name: Pull Vercel environment
         run: vercel pull --yes --environment=preview --token="$VERCEL_TOKEN"
