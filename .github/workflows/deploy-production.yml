@@ -58,25 +58,15 @@ jobs:
       - name: Install Vercel CLI
         run: npm install --global vercel@latest
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
       - name: Validate Vercel token
         run: |
-          echo "VERCEL_TOKEN length: ${#VERCEL_TOKEN}"
-          printf '%s' "$VERCEL_TOKEN" | sha256sum | awk '{print "VERCEL_TOKEN sha256: " $1}'
-
-          response_file="$(mktemp)"
-          status_code="$(curl --silent --show-error --write-out "%{http_code}" \
+          curl --fail --silent --show-error \
             --header "Authorization: Bearer $VERCEL_TOKEN" \
-            --output "$response_file" \
-            https://api.vercel.com/v2/user)"
-
-          if [ "$status_code" -lt 200 ] || [ "$status_code" -ge 300 ]; then
-            echo "Vercel token validation failed with HTTP $status_code"
-            cat "$response_file"
-            exit 1
-          fi
-
-          echo "Vercel token validation succeeded with HTTP $status_code"
-          cat "$response_file"
+            https://api.vercel.com/v2/user > /dev/null
+          echo "Vercel token validation succeeded"
 
       - name: Pull Vercel environment
         run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
