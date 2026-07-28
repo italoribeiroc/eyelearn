@@ -60,6 +60,9 @@ jobs:
 
       - name: Validate Vercel token
         run: |
+          echo "VERCEL_TOKEN length: ${#VERCEL_TOKEN}"
+          printf '%s' "$VERCEL_TOKEN" | sha256sum | awk '{print "VERCEL_TOKEN sha256: " $1}'
+
           response_file="$(mktemp)"
           status_code="$(curl --silent --show-error --write-out "%{http_code}" \
             --header "Authorization: Bearer $VERCEL_TOKEN" \
