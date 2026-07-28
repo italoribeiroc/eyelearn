@@ -11,5 +11,5 @@ def home(request):
 @api_view(['GET'])
 def hello_user(request, username):
     return Response({
-        'message': f'Hello, {username}! Welcome to Eyelearn'
+        'message': f'Hello, {username}!'
     })
