@@ -54,9 +54,11 @@ There is no `docker-compose` service for Django itself — only Postgres runs in
 
 ## CI/CD
 
+There are two separate Vercel projects: `eyelearn-staging` and `eyelearn` (production). Both GitHub Actions deploy workflows deploy to their target project's **Production** environment (`vercel --prod`) — neither uses Vercel Preview deployments. Which physical project each workflow hits is determined by GitHub **Environment**-scoped secrets (repo Settings → Environments → `Staging` / `Production`), not by the workflow YAML — both workflows read the same secret names (`VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, `VERCEL_TOKEN`) via `environment: name: Staging`/`Production`, and each GitHub Environment holds different values pointing at its respective Vercel project.
+
 Three GitHub Actions workflows in `.github/workflows/`:
 - `ci.yml` — runs Django checks + `api.tests accounts.tests` on every PR and on push to `main`/`develop`. Uses the SQLite fallback (no `DATABASE_URL` set in CI).
-- `deploy-staging.yml` — on push to `develop`, runs the same test job, then deploys to Vercel Preview via the Vercel CLI (`vercel pull` → `vercel build` → `vercel deploy --prebuilt`).
-- `deploy-production.yml` — on push to `main`, same test gate, then deploys to Vercel Production (`--prod` flag).
+- `deploy-staging.yml` — on push to `develop`, runs the same test job, then deploys to the `eyelearn-staging` project's Production environment via the Vercel CLI (`vercel pull --environment=production` → `vercel build --prod` → `vercel deploy --prebuilt --prod`).
+- `deploy-production.yml` — on push to `main`, same test gate, then deploys to the `eyelearn` project's Production environment the same way.
 
-Both deploy workflows require `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID`, `VERCEL_TOKEN` secrets and validate the token against the Vercel API before pulling/building/deploying.
+Both deploy workflows validate the Vercel token against the Vercel API before pulling/building/deploying. Migrations against Neon are run manually (not part of either workflow) — see Local database above for the one-off `DATABASE_URL=... manage.py migrate` pattern; run this against the relevant Neon database whenever models change, before or after deploying.
