@@ -44,6 +44,8 @@ CSRF_TRUSTED_ORIGINS = os.environ.get(
     'https://*.vercel.app',
 ).split(',')
 
+GOOGLE_OAUTH_CLIENT_ID = os.environ.get('GOOGLE_OAUTH_CLIENT_ID', '')
+
 
 # Application definition
 
