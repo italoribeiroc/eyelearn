@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -110,6 +111,82 @@ class AuthEndpointTests(TestCase):
             'username': 'alice',
             'email': 'alice@example.com',
         })
+
+
+class UpdateProfileEndpointTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username='alice',
+            email='alice@example.com',
+            password='alicepass123',
+        )
+        get_user_model().objects.create_user(
+            username='bob',
+            email='bob@example.com',
+            password='bobpass123',
+        )
+        login_response = self.client.post('/api/auth/login/', {
+            'username': 'alice',
+            'password': 'alicepass123',
+        })
+        self.access_token = login_response.json()['access']
+
+    def _patch(self, data):
+        return self.client.patch(
+            '/api/auth/me/',
+            data=json.dumps(data),
+            content_type='application/json',
+            HTTP_AUTHORIZATION=f'Bearer {self.access_token}',
+        )
+
+    def test_requires_authentication(self):
+        response = self.client.patch(
+            '/api/auth/me/',
+            data=json.dumps({'username': 'newname'}),
+            content_type='application/json',
+        )
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_updates_username_and_email(self):
+        response = self._patch({'username': 'alice2', 'email': 'alice2@example.com'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {
+            'id': self.user.id,
+            'username': 'alice2',
+            'email': 'alice2@example.com',
+        })
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.username, 'alice2')
+        self.assertEqual(self.user.email, 'alice2@example.com')
+
+    def test_partial_update_only_changes_given_field(self):
+        response = self._patch({'username': 'alice2'})
+
+        self.assertEqual(response.status_code, 200)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.username, 'alice2')
+        self.assertEqual(self.user.email, 'alice@example.com')
+
+    def test_rejects_username_already_taken(self):
+        response = self._patch({'username': 'bob'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('username', response.json())
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.username, 'alice')
+
+    def test_rejects_email_already_taken(self):
+        response = self._patch({'email': 'bob@example.com'})
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('email', response.json())
+
+    def test_keeping_own_current_username_is_not_rejected_as_taken(self):
+        response = self._patch({'username': 'alice', 'email': 'alice@example.com'})
+
+        self.assertEqual(response.status_code, 200)
 
 
 class GoogleAuthEndpointTests(TestCase):
