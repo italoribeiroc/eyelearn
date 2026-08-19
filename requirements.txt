@@ -6,3 +6,4 @@ python-dotenv==1.0.1
 djangorestframework-simplejwt==5.3.1
 google-auth==2.56.3
 requests==2.34.2
+stripe==15.5.1

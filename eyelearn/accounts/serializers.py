@@ -19,3 +19,9 @@ class RegisterSerializer(serializers.ModelSerializer):
 
 class GoogleAuthSerializer(serializers.Serializer):
     id_token = serializers.CharField()
+
+
+class UpdateProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = ['username', 'email']
