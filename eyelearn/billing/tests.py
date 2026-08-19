@@ -373,6 +373,8 @@ class StripeProviderTests(TestCase):
         _, kwargs = mock_create.call_args
         self.assertEqual(kwargs['line_items'][0]['price'], 'price_annual_brl')
         self.assertEqual(kwargs['client_reference_id'], '7')
+        self.assertTrue(kwargs['allow_promotion_codes'])
+        self.assertEqual(kwargs['payment_method_collection'], 'if_required')
 
     @patch('billing.providers.stripe_provider.stripe.Webhook.construct_event')
     def test_parse_webhook_event_raises_on_invalid_signature(self, mock_construct):

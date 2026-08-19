@@ -75,6 +75,20 @@ class StripeProvider(PaymentProvider):
                 cancel_url=cancel_url,
                 client_reference_id=str(user_id),
                 metadata={'user_id': user_id},
+                # Lets Stripe show its own "Add promotion code" field on the
+                # hosted Checkout page -- e.g. for beta-tester coupons. The
+                # coupon/promo code itself is created in Stripe (Dashboard or
+                # CLI), not in this app; a 100%-off code just makes the
+                # invoice $0 and flows through the existing webhook handling
+                # unchanged (it doesn't look at amounts).
+                allow_promotion_codes=True,
+                # Skip collecting a card when a promo code (or anything else)
+                # brings the total due today to $0 -- e.g. beta-tester
+                # coupons. Stripe still collects a card up front by default
+                # even for $0-today subscriptions, since future renewals
+                # could cost money; "if_required" defers that until an
+                # invoice actually needs payment.
+                payment_method_collection='if_required',
             )
         return CheckoutSession(url=session.url)
 
