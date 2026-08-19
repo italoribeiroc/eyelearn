@@ -46,6 +46,16 @@ CSRF_TRUSTED_ORIGINS = os.environ.get(
 
 GOOGLE_OAUTH_CLIENT_ID = os.environ.get('GOOGLE_OAUTH_CLIENT_ID', '')
 
+PAYMENT_PROVIDER = os.environ.get('PAYMENT_PROVIDER', 'stripe')
+STRIPE_SECRET_KEY = os.environ.get('STRIPE_SECRET_KEY', '')
+STRIPE_WEBHOOK_SECRET = os.environ.get('STRIPE_WEBHOOK_SECRET', '')
+STRIPE_PRICE_ID_MONTHLY_USD = os.environ.get('STRIPE_PRICE_ID_MONTHLY_USD', '')
+STRIPE_PRICE_ID_MONTHLY_BRL = os.environ.get('STRIPE_PRICE_ID_MONTHLY_BRL', '')
+STRIPE_PRICE_ID_ANNUAL_USD = os.environ.get('STRIPE_PRICE_ID_ANNUAL_USD', '')
+STRIPE_PRICE_ID_ANNUAL_BRL = os.environ.get('STRIPE_PRICE_ID_ANNUAL_BRL', '')
+
+FRONTEND_ALLOWED_ORIGINS = os.environ.get('FRONTEND_ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
+
 
 # Application definition
 
@@ -55,6 +65,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'api',
     'accounts',
+    'billing',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'

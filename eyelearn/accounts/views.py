@@ -10,7 +10,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .serializers import GoogleAuthSerializer, RegisterSerializer
+from .serializers import GoogleAuthSerializer, RegisterSerializer, UpdateProfileSerializer
 
 User = get_user_model()
 
@@ -34,10 +34,15 @@ def register(request):
     }, status=status.HTTP_201_CREATED)
 
 
-@api_view(['GET'])
+@api_view(['GET', 'PATCH'])
 @permission_classes([IsAuthenticated])
 def me(request):
     user = request.user
+    if request.method == 'PATCH':
+        serializer = UpdateProfileSerializer(user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
     return Response({
         'id': user.id,
         'username': user.username,
