@@ -56,6 +56,15 @@ STRIPE_PRICE_ID_ANNUAL_BRL = os.environ.get('STRIPE_PRICE_ID_ANNUAL_BRL', '')
 
 FRONTEND_ALLOWED_ORIGINS = os.environ.get('FRONTEND_ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
 
+STORAGE_BUCKET_NAME = os.environ.get('STORAGE_BUCKET_NAME', '')
+STORAGE_ACCESS_KEY_ID = os.environ.get('STORAGE_ACCESS_KEY_ID', '')
+STORAGE_SECRET_ACCESS_KEY = os.environ.get('STORAGE_SECRET_ACCESS_KEY', '')
+STORAGE_ENDPOINT_URL = os.environ.get('STORAGE_ENDPOINT_URL', '')
+STORAGE_REGION = os.environ.get('STORAGE_REGION', 'auto')
+
+FSRS_DESIRED_RETENTION = float(os.environ.get('FSRS_DESIRED_RETENTION', '0.9'))
+FSRS_ENABLE_FUZZING = os.environ.get('FSRS_ENABLE_FUZZING', 'False') == 'True'
+
 
 # Application definition
 
@@ -66,6 +75,7 @@ INSTALLED_APPS = [
     'api',
     'accounts',
     'billing',
+    'flashcards',
 ]
 
 AUTH_USER_MODEL = 'accounts.User'
