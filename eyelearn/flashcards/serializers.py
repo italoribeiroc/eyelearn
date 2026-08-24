@@ -1,13 +1,28 @@
 from rest_framework import serializers
 
 from . import storage
-from .models import Collection, Flashcard, FlashcardMedia, ReviewLog
+from .models import Collection, CollectionGoal, Flashcard, FlashcardMedia, ReviewLog
+from .services import ReviewService
 
 
 class CollectionSerializer(serializers.ModelSerializer):
+    flashcard_count = serializers.SerializerMethodField()
+    due_count = serializers.SerializerMethodField()
+
     class Meta:
         model = Collection
-        fields = ['id', 'name', 'description', 'parent', 'created_at', 'updated_at']
+        fields = [
+            'id', 'name', 'description', 'parent', 'flashcard_count', 'due_count', 'created_at', 'updated_at',
+        ]
+
+    def get_flashcard_count(self, collection):
+        return collection.flashcards.count()
+
+    def get_due_count(self, collection):
+        request = self.context.get('request')
+        if request is None:
+            return 0
+        return ReviewService().count_due(user=request.user, collection=collection)
 
 
 class FlashcardMediaSerializer(serializers.ModelSerializer):
@@ -68,6 +83,12 @@ class MediaConfirmSerializer(serializers.Serializer):
     side = serializers.ChoiceField(choices=FlashcardMedia.Side.choices)
     content_type = serializers.CharField()
     size_bytes = serializers.IntegerField(min_value=1)
+
+
+class CollectionGoalSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CollectionGoal
+        fields = ['target_date']
 
 
 class ReviewSubmissionSerializer(serializers.Serializer):

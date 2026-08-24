@@ -116,6 +116,45 @@ class ReviewState(models.Model):
         return f'{self.user_id}:{self.flashcard_id}'
 
 
+class CollectionGoal(models.Model):
+    """A user's target date to master (see ReviewState.State.REVIEW) every
+    flashcard in a collection's subtree."""
+
+    collection = models.OneToOneField(
+        Collection, on_delete=models.CASCADE, primary_key=True, related_name='goal',
+    )
+    target_date = models.DateField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'{self.collection_id} due {self.target_date}'
+
+
+class StudyDay(models.Model):
+    """Denormalized per-user daily review count, upserted from submit_review.
+
+    ReviewLog has no direct `user` FK (only via review_state.user) and grows
+    unboundedly, so streak/calendar queries read this table instead of
+    scanning ReviewLog.
+    """
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='study_days')
+    date = models.DateField()
+    cards_reviewed = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['user', 'date'], name='unique_user_study_day'),
+        ]
+        indexes = [models.Index(fields=['user', 'date'])]
+
+    def __str__(self):
+        return f'{self.user_id}:{self.date}'
+
+
 class ReviewLog(models.Model):
     class Rating(models.IntegerChoices):
         AGAIN = 1, 'Again'
