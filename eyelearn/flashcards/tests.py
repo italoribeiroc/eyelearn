@@ -7,8 +7,15 @@ from django.test import TestCase
 from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from flashcards.models import Collection, Flashcard, FlashcardMedia, ReviewLog, ReviewState
-from flashcards.services import CollectionCycleError, CollectionService, CrossOwnerParentError, ReviewService
+from flashcards.models import Collection, CollectionGoal, Flashcard, FlashcardMedia, ReviewLog, ReviewState, StudyDay
+from flashcards.services import (
+    CollectionCycleError,
+    CollectionService,
+    CrossOwnerParentError,
+    GoalService,
+    ReviewService,
+    StreakService,
+)
 
 User = get_user_model()
 
@@ -403,3 +410,358 @@ class StudyQueueTests(TestCase):
         body = response.json()
         self.assertEqual(len(body), 1)
         self.assertEqual(body[0]['flashcard']['id'], flashcard.id)
+
+    def test_count_due_matches_build_study_queue_length(self):
+        _make_flashcard(self.root)
+        _make_flashcard(self.child)
+        not_yet_due = _make_flashcard(self.root, prompt='future')
+        ReviewState.objects.create(user=self.user, flashcard=not_yet_due, due=timezone.now() + timedelta(days=5))
+
+        self.assertEqual(self.service.count_due(user=self.user, collection=self.root), 2)
+
+    def test_count_due_zero_when_no_flashcards(self):
+        self.assertEqual(self.service.count_due(user=self.user, collection=self.root), 0)
+
+    def test_collection_list_endpoint_includes_due_count(self):
+        _make_flashcard(self.root)
+        _make_flashcard(self.root)
+
+        response = self.client.get('/api/flashcards/collections/', **_auth_headers(self.user))
+
+        body = response.json()
+        root_entry = next(item for item in body if item['id'] == self.root.id)
+        self.assertEqual(root_entry['due_count'], 2)
+        self.assertEqual(root_entry['flashcard_count'], 2)
+
+
+def _master(user, flashcard):
+    """Mark a flashcard as mastered (ReviewState.State.REVIEW) for a user."""
+    return ReviewState.objects.create(
+        user=user, flashcard=flashcard, due=timezone.now(), state=ReviewState.State.REVIEW,
+    )
+
+
+class CollectionGoalTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.collection = _make_collection(self.user)
+        self.headers = _auth_headers(self.user)
+        self.today = timezone.now().date()
+
+    def test_get_404s_when_unset(self):
+        response = self.client.get(f'/api/flashcards/collections/{self.collection.id}/goal/', **self.headers)
+        self.assertEqual(response.status_code, 404)
+
+    def test_put_creates_goal(self):
+        target = self.today + timedelta(days=10)
+        response = self.client.put(
+            f'/api/flashcards/collections/{self.collection.id}/goal/',
+            data=json.dumps({'target_date': target.isoformat()}), content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['target_date'], target.isoformat())
+        self.assertTrue(CollectionGoal.objects.filter(collection=self.collection).exists())
+
+    def test_delete_clears_goal(self):
+        CollectionGoal.objects.create(collection=self.collection, target_date=self.today + timedelta(days=5))
+
+        response = self.client.delete(f'/api/flashcards/collections/{self.collection.id}/goal/', **self.headers)
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(CollectionGoal.objects.filter(collection=self.collection).exists())
+
+    def test_today_target_zero_when_nothing_remaining(self):
+        goal = CollectionGoal.objects.create(collection=self.collection, target_date=self.today + timedelta(days=5))
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal, today=self.today)
+
+        self.assertEqual(progress['total'], 0)
+        self.assertEqual(progress['today_target'], 0)
+        self.assertFalse(progress['overdue'])
+
+    def test_today_target_due_today_equals_remaining(self):
+        for _ in range(3):
+            _make_flashcard(self.collection)
+        goal = CollectionGoal.objects.create(collection=self.collection, target_date=self.today)
+
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal, today=self.today)
+
+        self.assertEqual(progress['remaining'], 3)
+        self.assertEqual(progress['today_target'], 3)
+        self.assertFalse(progress['overdue'])
+
+    def test_overdue_target_date_still_owes_all_remaining(self):
+        for _ in range(4):
+            _make_flashcard(self.collection)
+        goal = CollectionGoal.objects.create(collection=self.collection, target_date=self.today - timedelta(days=3))
+
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal, today=self.today)
+
+        self.assertEqual(progress['today_target'], 4)
+        self.assertTrue(progress['overdue'])
+
+    def test_today_target_paced_across_remaining_days(self):
+        for _ in range(10):
+            _make_flashcard(self.collection)
+        goal = CollectionGoal.objects.create(collection=self.collection, target_date=self.today + timedelta(days=5))
+
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal, today=self.today)
+
+        self.assertEqual(progress['remaining'], 10)
+        self.assertEqual(progress['today_target'], 2)  # ceil(10/5)
+
+    def test_today_target_decreases_after_reviewing_today(self):
+        cards = [_make_flashcard(self.collection, prompt=f'card-{i}') for i in range(5)]
+        goal = CollectionGoal.objects.create(collection=self.collection, target_date=self.today)
+
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal, today=self.today)
+        self.assertEqual(progress['today_target'], 5)
+
+        for card in cards[:2]:
+            ReviewService().submit_review(user=self.user, flashcard=card, rating=ReviewLog.Rating.GOOD)
+
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal, today=self.today)
+        self.assertEqual(progress['reviewed_today'], 2)
+        self.assertEqual(progress['today_target'], 3)
+
+
+class GoalServiceTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.collection = _make_collection(self.user)
+
+    def test_mastered_counts_only_review_state_cards(self):
+        mastered_card = _make_flashcard(self.collection, prompt='mastered')
+        _master(self.user, mastered_card)
+
+        learning_card = _make_flashcard(self.collection, prompt='learning')
+        ReviewState.objects.create(
+            user=self.user, flashcard=learning_card, due=timezone.now(), state=ReviewState.State.LEARNING,
+        )
+
+        _make_flashcard(self.collection, prompt='untouched-new')
+
+        goal = CollectionGoal.objects.create(
+            collection=self.collection, target_date=timezone.now().date() + timedelta(days=1),
+        )
+        progress = GoalService().get_goal_progress(user=self.user, collection=self.collection, goal=goal)
+
+        self.assertEqual(progress['total'], 3)
+        self.assertEqual(progress['mastered'], 1)
+        self.assertEqual(progress['remaining'], 2)
+
+
+class DailyStudyQueueTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.root = _make_collection(self.user, name='Root')
+        self.child = _make_collection(self.user, name='Child', parent=self.root)
+        self.today = timezone.now().date()
+
+    def test_parent_and_child_goals_dedupe_overlapping_due_cards(self):
+        shared_card = _make_flashcard(self.child, prompt='shared')
+        CollectionGoal.objects.create(collection=self.root, target_date=self.today)
+        CollectionGoal.objects.create(collection=self.child, target_date=self.today)
+
+        queue = GoalService().build_daily_study_queue(user=self.user)
+
+        self.assertEqual([rs.flashcard_id for rs in queue], [shared_card.id])
+
+    def test_goal_with_zero_target_contributes_nothing(self):
+        # No flashcards at all in this collection -> remaining=0 -> today_target=0.
+        CollectionGoal.objects.create(collection=self.root, target_date=self.today)
+
+        queue = GoalService().build_daily_study_queue(user=self.user)
+
+        self.assertEqual(queue, [])
+
+    def test_collection_without_goal_is_excluded(self):
+        _make_flashcard(self.root)  # no CollectionGoal created
+
+        queue = GoalService().build_daily_study_queue(user=self.user)
+
+        self.assertEqual(queue, [])
+
+    def test_respects_per_goal_today_target_cap(self):
+        for i in range(5):
+            _make_flashcard(self.root, prompt=f'card-{i}')
+        # 5 remaining, due in 5 days -> today_target = 1.
+        CollectionGoal.objects.create(collection=self.root, target_date=self.today + timedelta(days=5))
+
+        queue = GoalService().build_daily_study_queue(user=self.user)
+
+        self.assertEqual(len(queue), 1)
+
+    def test_daily_queue_shrinks_after_partial_progress_instead_of_restarting(self):
+        for i in range(6):
+            _make_flashcard(self.root, prompt=f'card-{i}')
+        # 6 remaining, due in 3 days -> today_target = 2.
+        CollectionGoal.objects.create(collection=self.root, target_date=self.today + timedelta(days=3))
+
+        first_queue = GoalService().build_daily_study_queue(user=self.user)
+        self.assertEqual(len(first_queue), 2)
+
+        # Simulate leaving the study page after reviewing what was shown, then coming back.
+        for review_state in first_queue:
+            ReviewService().submit_review(user=self.user, flashcard=review_state.flashcard, rating=ReviewLog.Rating.GOOD)
+
+        second_queue = GoalService().build_daily_study_queue(user=self.user)
+        reviewed_ids = {rs.flashcard_id for rs in first_queue}
+        second_ids = {rs.flashcard_id for rs in second_queue}
+
+        self.assertEqual(len(second_queue), 0)
+        self.assertFalse(reviewed_ids & second_ids)
+
+
+class CustomStudyQueueTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.other_user = _make_user(username='bob', email='bob@example.com')
+        self.collection_a = _make_collection(self.user, name='A')
+        self.collection_b = _make_collection(self.user, name='B')
+        self.headers = _auth_headers(self.user)
+
+    def test_merges_multiple_collections_without_goal_capping(self):
+        card_a = _make_flashcard(self.collection_a, prompt='a')
+        card_b = _make_flashcard(self.collection_b, prompt='b')
+
+        queue = ReviewService().build_multi_collection_queue(
+            user=self.user, collection_ids=[self.collection_a.id, self.collection_b.id],
+        )
+
+        self.assertEqual({rs.flashcard_id for rs in queue}, {card_a.id, card_b.id})
+
+    def test_endpoint_silently_drops_other_users_collection_id(self):
+        _make_flashcard(self.collection_a)
+        other_collection = _make_collection(self.other_user, name='Not yours')
+        _make_flashcard(other_collection)
+
+        response = self.client.get(
+            f'/api/flashcards/study/custom/?collections={self.collection_a.id},{other_collection.id}',
+            **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 1)
+
+    def test_endpoint_requires_at_least_one_collection_id(self):
+        response = self.client.get('/api/flashcards/study/custom/?collections=', **self.headers)
+        self.assertEqual(response.status_code, 400)
+
+
+class StreakServiceTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.service = StreakService()
+        self.today = timezone.now().date()
+
+    def test_zero_when_no_study_days(self):
+        self.assertEqual(self.service.get_current_streak(user=self.user, today=self.today), 0)
+
+    def test_gap_free_run_counts_consecutive_days(self):
+        for offset in range(3):
+            StudyDay.objects.create(user=self.user, date=self.today - timedelta(days=offset), cards_reviewed=1)
+
+        self.assertEqual(self.service.get_current_streak(user=self.user, today=self.today), 3)
+
+    def test_studied_yesterday_not_today_still_counts(self):
+        StudyDay.objects.create(user=self.user, date=self.today - timedelta(days=1), cards_reviewed=1)
+        StudyDay.objects.create(user=self.user, date=self.today - timedelta(days=2), cards_reviewed=1)
+
+        self.assertEqual(self.service.get_current_streak(user=self.user, today=self.today), 2)
+
+    def test_broken_streak_stops_at_the_gap(self):
+        StudyDay.objects.create(user=self.user, date=self.today, cards_reviewed=1)
+        StudyDay.objects.create(user=self.user, date=self.today - timedelta(days=1), cards_reviewed=1)
+        # Gap at days=2
+        StudyDay.objects.create(user=self.user, date=self.today - timedelta(days=3), cards_reviewed=1)
+
+        self.assertEqual(self.service.get_current_streak(user=self.user, today=self.today), 2)
+
+
+class StudyDayUpsertTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.collection = _make_collection(self.user)
+        self.service = ReviewService()
+
+    def test_two_reviews_same_day_upsert_into_one_row(self):
+        card_one = _make_flashcard(self.collection, prompt='one')
+        card_two = _make_flashcard(self.collection, prompt='two')
+        now = timezone.now()
+
+        self.service.submit_review(user=self.user, flashcard=card_one, rating=ReviewLog.Rating.GOOD, reviewed_at=now)
+        self.service.submit_review(user=self.user, flashcard=card_two, rating=ReviewLog.Rating.GOOD, reviewed_at=now)
+
+        self.assertEqual(StudyDay.objects.filter(user=self.user).count(), 1)
+        self.assertEqual(StudyDay.objects.get(user=self.user).cards_reviewed, 2)
+
+    def test_reviews_on_different_days_create_separate_rows(self):
+        card_one = _make_flashcard(self.collection, prompt='one')
+        card_two = _make_flashcard(self.collection, prompt='two')
+        day_one = timezone.now()
+        day_two = day_one + timedelta(days=1)
+
+        self.service.submit_review(user=self.user, flashcard=card_one, rating=ReviewLog.Rating.GOOD, reviewed_at=day_one)
+        self.service.submit_review(user=self.user, flashcard=card_two, rating=ReviewLog.Rating.GOOD, reviewed_at=day_two)
+
+        self.assertEqual(StudyDay.objects.filter(user=self.user).count(), 2)
+
+
+class StreakCalendarEndpointTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.headers = _auth_headers(self.user)
+        self.today = timezone.now().date()
+
+    def test_shape_and_studied_correctness(self):
+        StudyDay.objects.create(user=self.user, date=self.today, cards_reviewed=4)
+        start = self.today - timedelta(days=1)
+
+        response = self.client.get(
+            f'/api/flashcards/streak/?start={start.isoformat()}&end={self.today.isoformat()}', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['current_streak'], 1)
+        self.assertEqual(len(body['days']), 2)
+        self.assertEqual(body['days'][0]['studied'], False)
+        self.assertEqual(body['days'][1]['studied'], True)
+        self.assertEqual(body['days'][1]['cards_reviewed'], 4)
+
+    def test_oversized_range_rejected(self):
+        start = self.today - timedelta(days=400)
+
+        response = self.client.get(
+            f'/api/flashcards/streak/?start={start.isoformat()}&end={self.today.isoformat()}', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_missing_params_rejected(self):
+        response = self.client.get('/api/flashcards/streak/', **self.headers)
+        self.assertEqual(response.status_code, 400)
+
+
+class GoalsSummaryEndpointTests(TestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.collection = _make_collection(self.user)
+        self.headers = _auth_headers(self.user)
+
+    def test_summary_reflects_streak_studied_today_and_active_goals(self):
+        _make_flashcard(self.collection)
+        StudyDay.objects.create(user=self.user, date=timezone.now().date(), cards_reviewed=2)
+        CollectionGoal.objects.create(collection=self.collection, target_date=timezone.now().date())
+
+        response = self.client.get('/api/flashcards/goals/summary/', **self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['streak'], 1)
+        self.assertEqual(body['cards_studied_today'], 2)
+        self.assertEqual(len(body['active_goals']), 1)
+        self.assertEqual(body['active_goals'][0]['collection_name'], self.collection.name)
+        self.assertEqual(body['daily_due_count'], 1)
+        self.assertEqual(body['daily_target_total'], 1)
