@@ -1,7 +1,7 @@
-from django.test import SimpleTestCase
+from eyelearn.test_utils import ApiSimpleTestCase
 
 
-class ApiEndpointTests(SimpleTestCase):
+class ApiEndpointTests(ApiSimpleTestCase):
     def test_home_endpoint(self):
         response = self.client.get('/')
 

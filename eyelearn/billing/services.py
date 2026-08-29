@@ -90,6 +90,12 @@ class BillingService:
             )
         return session.url
 
+    def cancel_active_subscription(self, *, user) -> None:
+        subscription = get_active_subscription(user)
+        if subscription is None:
+            return
+        self.provider.cancel_subscription(subscription_ref=subscription.provider_subscription_id)
+
     def get_status(self, *, user) -> SubscriptionStatusDTO:
         subscription = get_active_subscription(user)
         if subscription is None:

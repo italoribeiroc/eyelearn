@@ -16,6 +16,7 @@ from .models import Collection, CollectionGoal, Flashcard, FlashcardMedia, Revie
 logger = logging.getLogger(__name__)
 
 FREE_COLLECTION_LIMIT = 3
+FREE_FLASHCARD_LIMIT = 300
 
 
 class CollectionCycleError(Exception):
@@ -28,6 +29,10 @@ class CrossOwnerParentError(Exception):
 
 class CollectionLimitError(Exception):
     """Raised when a free-plan user tries to exceed FREE_COLLECTION_LIMIT collections."""
+
+
+class FlashcardLimitError(Exception):
+    """Raised when a free-plan user tries to exceed FREE_FLASHCARD_LIMIT flashcards."""
 
 
 class UnsupportedMediaError(Exception):
@@ -119,6 +124,16 @@ class CollectionService:
                 raise CollectionCycleError('A collection cannot be its own parent.')
             if parent.id in self.get_subtree_ids(collection=collection):
                 raise CollectionCycleError('Cannot move a collection under its own descendant.')
+
+
+class FlashcardService:
+    def assert_can_create(self, *, user):
+        if get_active_subscription(user) is None:
+            existing_count = Flashcard.objects.filter(collection__user=user).count()
+            if existing_count >= FREE_FLASHCARD_LIMIT:
+                raise FlashcardLimitError(
+                    f'Free plan is limited to {FREE_FLASHCARD_LIMIT} flashcards. Upgrade to Pro for unlimited flashcards.',
+                )
 
 
 def _cleanup_storage_keys(storage_keys):

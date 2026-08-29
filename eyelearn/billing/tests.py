@@ -30,6 +30,7 @@ class FakePaymentProvider(PaymentProvider):
         self.portal_calls = []
         self.events = {}
         self.missing_customer_refs = set()
+        self.canceled_subscription_refs = []
 
     @property
     def name(self):
@@ -63,9 +64,38 @@ class FakePaymentProvider(PaymentProvider):
     def parse_webhook_event(self, *, payload, headers):
         return self.events[payload]
 
+    def cancel_subscription(self, *, subscription_ref):
+        self.canceled_subscription_refs.append(subscription_ref)
+
 
 def _make_user(username='alice', email='alice@example.com'):
     return User.objects.create_user(username=username, email=email, password='irrelevant123')
+
+
+class CancelActiveSubscriptionTests(TestCase):
+    def setUp(self):
+        self.provider = FakePaymentProvider()
+        self.service = BillingService(provider=self.provider)
+        self.user = _make_user()
+
+    def test_cancels_active_subscription(self):
+        customer = PaymentCustomer.objects.create(
+            user=self.user, provider='fake', provider_customer_id='cus_fake_1',
+        )
+        Subscription.objects.create(
+            customer=customer, provider='fake', provider_subscription_id='sub_1',
+            provider_price_id='price_1', plan='monthly', currency='usd',
+            status=Subscription.Status.ACTIVE,
+        )
+
+        self.service.cancel_active_subscription(user=self.user)
+
+        self.assertEqual(self.provider.canceled_subscription_refs, ['sub_1'])
+
+    def test_no_op_without_active_subscription(self):
+        self.service.cancel_active_subscription(user=self.user)
+
+        self.assertEqual(self.provider.canceled_subscription_refs, [])
 
 
 class StartCheckoutTests(TestCase):

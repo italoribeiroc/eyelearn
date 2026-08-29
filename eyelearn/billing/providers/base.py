@@ -103,3 +103,13 @@ class PaymentProvider(ABC):
 
         Raises InvalidWebhookSignature if the payload fails verification.
         """
+
+    @abstractmethod
+    def cancel_subscription(self, *, subscription_ref: str) -> None:
+        """Cancels a subscription immediately (not at period end).
+
+        Used when the account it belongs to is being deleted -- best-effort:
+        implementations should tolerate the subscription already being gone
+        or canceled on the provider's side rather than raising, since that
+        shouldn't block the account deletion that triggered this call.
+        """

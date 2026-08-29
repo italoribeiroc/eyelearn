@@ -1,16 +1,22 @@
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import status
-from rest_framework.decorators import api_view, authentication_classes, permission_classes
+from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 
 from .providers.base import InvalidWebhookSignature
 from .serializers import CheckoutSessionRequestSerializer, PortalSessionRequestSerializer
 from .services import AlreadySubscribedError, BillingService, NoPaymentCustomerError
 
 
+class CheckoutSessionRateThrottle(UserRateThrottle):
+    scope = 'checkout_session'
+
+
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@throttle_classes([CheckoutSessionRateThrottle])
 def create_checkout_session(request):
     serializer = CheckoutSessionRequestSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)

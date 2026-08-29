@@ -23,6 +23,8 @@ from .services import (
     CollectionLimitError,
     CollectionService,
     CrossOwnerParentError,
+    FlashcardLimitError,
+    FlashcardService,
     GoalService,
     MediaService,
     ReviewService,
@@ -103,6 +105,12 @@ def flashcard_list(request, collection_id):
 
     serializer = FlashcardSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
+
+    try:
+        FlashcardService().assert_can_create(user=request.user)
+    except FlashcardLimitError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+
     flashcard = serializer.save(collection=collection)
     return Response(FlashcardSerializer(flashcard).data, status=status.HTTP_201_CREATED)
 
