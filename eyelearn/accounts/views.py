@@ -5,18 +5,57 @@ from django.contrib.auth import get_user_model
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token as google_id_token
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import AnonRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .serializers import GoogleAuthSerializer, RegisterSerializer, UpdateProfileSerializer
+from .serializers import (
+    AccountDeletionSerializer,
+    GoogleAuthSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
+    RegisterSerializer,
+    UpdateProfileSerializer,
+)
+from .services import AccountDeletionService, InvalidResetTokenError, PasswordResetService
 
 User = get_user_model()
 
 
+class RegisterRateThrottle(AnonRateThrottle):
+    scope = 'register'
+
+
+class LoginRateThrottle(AnonRateThrottle):
+    scope = 'login'
+
+
+class RefreshRateThrottle(AnonRateThrottle):
+    scope = 'token_refresh'
+
+
+class PasswordResetRequestRateThrottle(AnonRateThrottle):
+    scope = 'password_reset_request'
+
+
+class PasswordResetConfirmRateThrottle(AnonRateThrottle):
+    scope = 'password_reset_confirm'
+
+
+class ThrottledTokenObtainPairView(TokenObtainPairView):
+    throttle_classes = [LoginRateThrottle]
+
+
+class ThrottledTokenRefreshView(TokenRefreshView):
+    throttle_classes = [RefreshRateThrottle]
+
+
 @api_view(['POST'])
 @permission_classes([AllowAny])
+@throttle_classes([RegisterRateThrottle])
 def register(request):
     serializer = RegisterSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -28,16 +67,24 @@ def register(request):
             'id': user.id,
             'username': user.username,
             'email': user.email,
+            'first_name': user.first_name,
         },
         'access': str(refresh.access_token),
         'refresh': str(refresh),
     }, status=status.HTTP_201_CREATED)
 
 
-@api_view(['GET', 'PATCH'])
+@api_view(['GET', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticated])
 def me(request):
     user = request.user
+
+    if request.method == 'DELETE':
+        serializer = AccountDeletionSerializer(data=request.data, context={'request': request})
+        serializer.is_valid(raise_exception=True)
+        AccountDeletionService().delete_account(user=user)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     if request.method == 'PATCH':
         serializer = UpdateProfileSerializer(user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
@@ -47,6 +94,7 @@ def me(request):
         'id': user.id,
         'username': user.username,
         'email': user.email,
+        'first_name': user.first_name,
     })
 
 
@@ -85,7 +133,10 @@ def google_auth(request):
     if user is None:
         user, created = User.objects.get_or_create(
             email=email,
-            defaults={'username': _generate_unique_username(email)},
+            defaults={
+                'username': _generate_unique_username(email),
+                'first_name': idinfo.get('given_name', ''),
+            },
         )
         if created:
             user.set_unusable_password()
@@ -99,7 +150,40 @@ def google_auth(request):
             'id': user.id,
             'username': user.username,
             'email': user.email,
+            'first_name': user.first_name,
         },
         'access': str(refresh.access_token),
         'refresh': str(refresh),
     }, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([PasswordResetRequestRateThrottle])
+def password_reset_request(request):
+    serializer = PasswordResetRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    PasswordResetService().request_reset(
+        email=serializer.validated_data['email'],
+        locale=serializer.validated_data['locale'],
+    )
+
+    return Response({'detail': 'If that email exists, a reset link has been sent.'})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([PasswordResetConfirmRateThrottle])
+def password_reset_confirm(request):
+    serializer = PasswordResetConfirmSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        PasswordResetService().confirm_reset(**serializer.validated_data)
+    except InvalidResetTokenError:
+        return Response(
+            {'detail': 'This reset link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response({'detail': 'Password has been reset.'})

@@ -4,14 +4,19 @@ from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase
+
+from eyelearn.test_utils import ApiTestCase
 from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 
+from billing.models import PaymentCustomer, Subscription
 from flashcards.models import Collection, CollectionGoal, Flashcard, FlashcardMedia, ReviewLog, ReviewState, StudyDay
 from flashcards.services import (
     CollectionCycleError,
     CollectionService,
     CrossOwnerParentError,
+    FREE_FLASHCARD_LIMIT,
+    FlashcardService,
     GoalService,
     ReviewService,
     StreakService,
@@ -39,7 +44,7 @@ def _auth_headers(user):
     return {'HTTP_AUTHORIZATION': f'Bearer {token}'}
 
 
-class CollectionCRUDTests(TestCase):
+class CollectionCRUDTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.other_user = _make_user(username='bob', email='bob@example.com')
@@ -129,7 +134,7 @@ class CollectionNestingTests(TestCase):
             self.service.update_collection(collection=collection, parent=other_collection)
 
 
-class FlashcardCRUDTests(TestCase):
+class FlashcardCRUDTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.headers = _auth_headers(self.user)
@@ -190,7 +195,54 @@ class FlashcardCRUDTests(TestCase):
         self.assertEqual(response.status_code, 404)
 
 
-class MediaUploadFlowTests(TestCase):
+class FlashcardLimitTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    def _bulk_create_flashcards(self, count):
+        Flashcard.objects.bulk_create([
+            Flashcard(collection=self.collection, card_type=Flashcard.CardType.BASIC, prompt=f'q{i}', answer=f'a{i}')
+            for i in range(count)
+        ])
+
+    def _post_flashcard(self, prompt='One more?'):
+        return self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/flashcards/',
+            data=json.dumps({'card_type': 'basic', 'prompt': prompt, 'answer': 'Yes'}),
+            content_type='application/json', **self.headers,
+        )
+
+    def test_creation_allowed_just_under_limit(self):
+        self._bulk_create_flashcards(FREE_FLASHCARD_LIMIT - 1)
+
+        response = self._post_flashcard()
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_creation_blocked_at_limit(self):
+        self._bulk_create_flashcards(FREE_FLASHCARD_LIMIT)
+
+        response = self._post_flashcard('One too many?')
+
+        self.assertEqual(response.status_code, 402)
+        self.assertIn(str(FREE_FLASHCARD_LIMIT), response.json()['detail'])
+
+    def test_subscribed_user_not_capped(self):
+        customer = PaymentCustomer.objects.create(user=self.user, provider_customer_id='cus_test')
+        Subscription.objects.create(
+            customer=customer, provider_subscription_id='sub_test', provider_price_id='price_test',
+            plan=Subscription.Plan.MONTHLY, currency='usd', status=Subscription.Status.ACTIVE,
+        )
+        self._bulk_create_flashcards(FREE_FLASHCARD_LIMIT + 5)
+
+        response = self._post_flashcard('Pro card?')
+
+        self.assertEqual(response.status_code, 201)
+
+
+class MediaUploadFlowTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.headers = _auth_headers(self.user)
@@ -253,7 +305,7 @@ class MediaUploadFlowTests(TestCase):
         mock_delete.assert_called_once_with(key='flashcards/1/1/image/abc.png')
 
 
-class ReviewSchedulingTests(TestCase):
+class ReviewSchedulingTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.collection = _make_collection(self.user)
@@ -341,7 +393,7 @@ class ReviewSchedulingTests(TestCase):
         self.assertEqual(body['reps'], 1)
 
 
-class StudyQueueTests(TestCase):
+class StudyQueueTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.other_user = _make_user(username='bob', email='bob@example.com')
@@ -441,7 +493,7 @@ def _master(user, flashcard):
     )
 
 
-class CollectionGoalTests(TestCase):
+class CollectionGoalTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.collection = _make_collection(self.user)
@@ -613,7 +665,7 @@ class DailyStudyQueueTests(TestCase):
         self.assertFalse(reviewed_ids & second_ids)
 
 
-class CustomStudyQueueTests(TestCase):
+class CustomStudyQueueTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.other_user = _make_user(username='bob', email='bob@example.com')
@@ -708,7 +760,7 @@ class StudyDayUpsertTests(TestCase):
         self.assertEqual(StudyDay.objects.filter(user=self.user).count(), 2)
 
 
-class StreakCalendarEndpointTests(TestCase):
+class StreakCalendarEndpointTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.headers = _auth_headers(self.user)
@@ -744,7 +796,7 @@ class StreakCalendarEndpointTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
 
-class GoalsSummaryEndpointTests(TestCase):
+class GoalsSummaryEndpointTests(ApiTestCase):
     def setUp(self):
         self.user = _make_user()
         self.collection = _make_collection(self.user)

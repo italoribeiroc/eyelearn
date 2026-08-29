@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,14 +26,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = os.environ.get(
-    'SECRET_KEY',
-    'django-insecure-)(j%pxjfp(3ll)p(68=97a3omzzh@fm5g-z6&5=qj3n2@++hg0',
-)
-
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.environ.get('DEBUG', 'False' if os.environ.get('VERCEL') else 'True') == 'True'
+
+# SECURITY WARNING: keep the secret key used in production secret!
+SECRET_KEY = os.environ.get('SECRET_KEY', '')
+if not SECRET_KEY:
+    if DEBUG:
+        SECRET_KEY = 'django-insecure-local-dev-only-do-not-deploy'
+    else:
+        raise ImproperlyConfigured('SECRET_KEY environment variable must be set when DEBUG is False.')
 
 ALLOWED_HOSTS = os.environ.get(
     'ALLOWED_HOSTS',
@@ -56,6 +59,23 @@ STRIPE_PRICE_ID_ANNUAL_BRL = os.environ.get('STRIPE_PRICE_ID_ANNUAL_BRL', '')
 
 FRONTEND_ALLOWED_ORIGINS = os.environ.get('FRONTEND_ALLOWED_ORIGINS', 'http://localhost:3000').split(',')
 
+# Single canonical frontend URL used to build password-reset links (unlike
+# FRONTEND_ALLOWED_ORIGINS, which is a list for CORS/redirect validation).
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+# Resend (https://resend.com) is used to send password-reset emails. Without
+# a verified sending domain in the Resend dashboard, RESEND_FROM_EMAIL can
+# only deliver to the account's own verified address.
+RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
+RESEND_FROM_EMAIL = os.environ.get('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
+
+# Shared secret the Next.js BFF attaches on every outbound call (see
+# eyelearn.middleware.InternalApiKeyMiddleware). Required in every
+# environment, including local dev -- generate one with
+# `python -c "import secrets; print(secrets.token_urlsafe(32))"` and put
+# the same value in eyelearn-ui's EYELEARN_INTERNAL_API_KEY.
+INTERNAL_API_KEY = os.environ.get('INTERNAL_API_KEY', '')
+
 STORAGE_BUCKET_NAME = os.environ.get('STORAGE_BUCKET_NAME', '')
 STORAGE_ACCESS_KEY_ID = os.environ.get('STORAGE_ACCESS_KEY_ID', '')
 STORAGE_SECRET_ACCESS_KEY = os.environ.get('STORAGE_SECRET_ACCESS_KEY', '')
@@ -71,6 +91,7 @@ FSRS_ENABLE_FUZZING = os.environ.get('FSRS_ENABLE_FUZZING', 'False') == 'True'
 INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.auth',
+    'corsheaders',
     'rest_framework',
     'api',
     'accounts',
@@ -82,10 +103,14 @@ AUTH_USER_MODEL = 'accounts.User'
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'eyelearn.middleware.InternalApiKeyMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+CORS_ALLOWED_ORIGINS = FRONTEND_ALLOWED_ORIGINS
 
 ROOT_URLCONF = 'eyelearn.urls'
 
@@ -136,11 +161,40 @@ USE_I18N = True
 USE_TZ = True
 
 
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'django_cache_table',
+    }
+}
+
 REST_FRAMEWORK = {
     'UNAUTHENTICATED_USER': None,
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'rest_framework_simplejwt.authentication.JWTAuthentication',
     ],
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.IsAuthenticated',
+    ],
+    'DEFAULT_THROTTLE_CLASSES': [
+        'rest_framework.throttling.AnonRateThrottle',
+        'rest_framework.throttling.UserRateThrottle',
+    ],
+    'DEFAULT_THROTTLE_RATES': {
+        'anon': '60/min',
+        'user': '120/min',
+        'register': '5/hour',
+        'login': '10/hour',
+        'token_refresh': '30/hour',
+        'checkout_session': '10/hour',
+        'password_reset_request': '5/hour',
+        'password_reset_confirm': '10/hour',
+    },
+    'DEFAULT_RENDERER_CLASSES': (
+        ['rest_framework.renderers.JSONRenderer', 'rest_framework.renderers.BrowsableAPIRenderer']
+        if DEBUG else
+        ['rest_framework.renderers.JSONRenderer']
+    ),
 }
 
 STATIC_URL = 'static/'

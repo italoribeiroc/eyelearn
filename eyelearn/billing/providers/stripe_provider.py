@@ -1,3 +1,4 @@
+import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Mapping, Optional
@@ -14,6 +15,8 @@ from .base import (
     PaymentProvider,
     PortalSession,
 )
+
+logger = logging.getLogger(__name__)
 
 _STRIPE_STATUS_MAP = {
     'incomplete': 'incomplete',
@@ -108,6 +111,14 @@ class StripeProvider(PaymentProvider):
         with _translate_missing_customer():
             session = stripe.billing_portal.Session.create(**kwargs)
         return PortalSession(url=session.url)
+
+    def cancel_subscription(self, *, subscription_ref: str) -> None:
+        try:
+            stripe.Subscription.cancel(subscription_ref)
+        except stripe.error.StripeError:
+            # Best-effort: e.g. already canceled/deleted on Stripe's side.
+            # Shouldn't block the account deletion that triggered this.
+            logger.exception('Failed to cancel Stripe subscription %s', subscription_ref)
 
     def parse_webhook_event(self, *, payload: bytes, headers: Mapping[str, str]) -> NormalizedEvent:
         signature = headers.get('Stripe-Signature') or headers.get('stripe-signature')
