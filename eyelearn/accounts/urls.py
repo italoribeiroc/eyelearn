@@ -8,6 +8,8 @@ from .views import (
     password_reset_confirm,
     password_reset_request,
     register,
+    resend_verification,
+    verify_email,
 )
 
 urlpatterns = [
@@ -18,4 +20,6 @@ urlpatterns = [
     path('google/', google_auth, name='google_auth'),
     path('password-reset/', password_reset_request, name='password_reset_request'),
     path('password-reset/confirm/', password_reset_confirm, name='password_reset_confirm'),
+    path('verify-email/', verify_email, name='verify_email'),
+    path('verify-email/resend/', resend_verification, name='resend_verification'),
 ]
