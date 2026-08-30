@@ -69,6 +69,11 @@ FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
 RESEND_API_KEY = os.environ.get('RESEND_API_KEY', '')
 RESEND_FROM_EMAIL = os.environ.get('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
 
+# Where the Help page's contact form notifies the team of a new submission.
+# Left unset in an environment silently skips that notification email (the
+# ContactMessage row and the submitter's confirmation email still go out).
+CONTACT_NOTIFICATION_EMAIL = os.environ.get('CONTACT_NOTIFICATION_EMAIL', '')
+
 # Shared secret the Next.js BFF attaches on every outbound call (see
 # eyelearn.middleware.InternalApiKeyMiddleware). Required in every
 # environment, including local dev -- generate one with
@@ -189,6 +194,9 @@ REST_FRAMEWORK = {
         'checkout_session': '10/hour',
         'password_reset_request': '5/hour',
         'password_reset_confirm': '10/hour',
+        'email_verification_confirm': '10/hour',
+        'email_verification_resend': '5/hour',
+        'contact_form': '5/hour',
     },
     'DEFAULT_RENDERER_CLASSES': (
         ['rest_framework.renderers.JSONRenderer', 'rest_framework.renderers.BrowsableAPIRenderer']

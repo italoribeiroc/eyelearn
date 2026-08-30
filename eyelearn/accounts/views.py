@@ -14,13 +14,21 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
 from .serializers import (
     AccountDeletionSerializer,
+    EmailVerificationConfirmSerializer,
     GoogleAuthSerializer,
     PasswordResetConfirmSerializer,
     PasswordResetRequestSerializer,
     RegisterSerializer,
+    ResendVerificationSerializer,
     UpdateProfileSerializer,
 )
-from .services import AccountDeletionService, InvalidResetTokenError, PasswordResetService
+from .services import (
+    AccountDeletionService,
+    EmailVerificationService,
+    InvalidResetTokenError,
+    InvalidVerificationTokenError,
+    PasswordResetService,
+)
 
 User = get_user_model()
 
@@ -45,6 +53,14 @@ class PasswordResetConfirmRateThrottle(AnonRateThrottle):
     scope = 'password_reset_confirm'
 
 
+class EmailVerificationResendRateThrottle(AnonRateThrottle):
+    scope = 'email_verification_resend'
+
+
+class EmailVerificationConfirmRateThrottle(AnonRateThrottle):
+    scope = 'email_verification_confirm'
+
+
 class ThrottledTokenObtainPairView(TokenObtainPairView):
     throttle_classes = [LoginRateThrottle]
 
@@ -57,21 +73,27 @@ class ThrottledTokenRefreshView(TokenRefreshView):
 @permission_classes([AllowAny])
 @throttle_classes([RegisterRateThrottle])
 def register(request):
+    # Clear out any abandoned (never-verified) signup squatting this
+    # username/email before validating, so a typo'd registration attempt
+    # doesn't permanently block a retry.
+    EmailVerificationService().reclaim_stale_signup(
+        username=request.data.get('username'), email=request.data.get('email'),
+    )
+
     serializer = RegisterSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     user = serializer.save()
 
-    refresh = RefreshToken.for_user(user)
-    return Response({
-        'user': {
-            'id': user.id,
-            'username': user.username,
-            'email': user.email,
-            'first_name': user.first_name,
-        },
-        'access': str(refresh.access_token),
-        'refresh': str(refresh),
-    }, status=status.HTTP_201_CREATED)
+    plan = request.data.get('plan')
+    EmailVerificationService().send_verification_email(
+        user=user,
+        locale=serializer.validated_data.get('locale', 'en'),
+        plan=plan if plan in ('monthly', 'annual') else None,
+    )
+
+    return Response(
+        {'detail': 'Account created. Check your email to verify it.'}, status=status.HTTP_201_CREATED,
+    )
 
 
 @api_view(['GET', 'PATCH', 'DELETE'])
@@ -95,6 +117,7 @@ def me(request):
         'username': user.username,
         'email': user.email,
         'first_name': user.first_name,
+        'has_seen_onboarding': user.has_seen_onboarding,
     })
 
 
@@ -151,6 +174,7 @@ def google_auth(request):
             'username': user.username,
             'email': user.email,
             'first_name': user.first_name,
+            'has_seen_onboarding': user.has_seen_onboarding,
         },
         'access': str(refresh.access_token),
         'refresh': str(refresh),
@@ -187,3 +211,35 @@ def password_reset_confirm(request):
         )
 
     return Response({'detail': 'Password has been reset.'})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([EmailVerificationConfirmRateThrottle])
+def verify_email(request):
+    serializer = EmailVerificationConfirmSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        EmailVerificationService().confirm(**serializer.validated_data)
+    except InvalidVerificationTokenError:
+        return Response(
+            {'detail': 'This verification link is invalid or has expired.'}, status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    return Response({'detail': 'Email verified. You can now log in.'})
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@throttle_classes([EmailVerificationResendRateThrottle])
+def resend_verification(request):
+    serializer = ResendVerificationSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    EmailVerificationService().resend(
+        email=serializer.validated_data['email'],
+        locale=serializer.validated_data['locale'],
+    )
+
+    return Response({'detail': 'If that email exists and needs verification, a new link has been sent.'})

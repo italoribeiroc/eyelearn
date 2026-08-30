@@ -1,4 +1,5 @@
 import json
+from datetime import timedelta
 from unittest.mock import patch
 
 from django.conf import settings
@@ -9,8 +10,9 @@ from eyelearn.test_utils import ApiTestCase
 from flashcards.models import Collection, Flashcard, FlashcardMedia, ReviewState, StudyDay
 
 
+@patch('accounts.services.send_verification_email')
 class RegisterEndpointTests(ApiTestCase):
-    def test_register_creates_user_and_returns_tokens(self):
+    def test_register_creates_inactive_user_and_sends_verification_email(self, mock_send):
         response = self.client.post('/api/auth/register/', {
             'username': 'bob',
             'email': 'bob@example.com',
@@ -19,16 +21,29 @@ class RegisterEndpointTests(ApiTestCase):
         })
 
         self.assertEqual(response.status_code, 201)
-        body = response.json()
-        self.assertEqual(body['user']['username'], 'bob')
-        self.assertEqual(body['user']['email'], 'bob@example.com')
-        self.assertEqual(body['user']['first_name'], 'Bob')
-        self.assertNotIn('password', body['user'])
-        self.assertIn('access', body)
-        self.assertIn('refresh', body)
-        self.assertTrue(get_user_model().objects.filter(username='bob').exists())
+        self.assertNotIn('access', response.json())
+        self.assertNotIn('refresh', response.json())
+        user = get_user_model().objects.get(username='bob')
+        self.assertEqual(user.email, 'bob@example.com')
+        self.assertEqual(user.first_name, 'Bob')
+        self.assertFalse(user.is_active)
+        mock_send.assert_called_once()
 
-    def test_register_rejects_missing_first_name(self):
+    def test_registered_user_cannot_log_in_before_verifying(self, mock_send):
+        self.client.post('/api/auth/register/', {
+            'username': 'bob',
+            'email': 'bob@example.com',
+            'password': 'a-strong-password-123',
+            'first_name': 'Bob',
+        })
+
+        response = self.client.post('/api/auth/login/', {
+            'username': 'bob', 'password': 'a-strong-password-123',
+        })
+
+        self.assertEqual(response.status_code, 401)
+
+    def test_register_rejects_missing_first_name(self, mock_send):
         response = self.client.post('/api/auth/register/', {
             'username': 'bob',
             'email': 'bob@example.com',
@@ -38,7 +53,7 @@ class RegisterEndpointTests(ApiTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('first_name', response.json())
 
-    def test_register_rejects_duplicate_username(self):
+    def test_register_rejects_duplicate_username(self, mock_send):
         get_user_model().objects.create_user(
             username='bob', email='first@example.com', password='a-strong-password-123',
         )
@@ -53,7 +68,7 @@ class RegisterEndpointTests(ApiTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('username', response.json())
 
-    def test_register_rejects_duplicate_email(self):
+    def test_register_rejects_duplicate_email(self, mock_send):
         get_user_model().objects.create_user(
             username='first', email='bob@example.com', password='a-strong-password-123',
         )
@@ -68,7 +83,7 @@ class RegisterEndpointTests(ApiTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('email', response.json())
 
-    def test_register_rejects_weak_password(self):
+    def test_register_rejects_weak_password(self, mock_send):
         response = self.client.post('/api/auth/register/', {
             'username': 'bob',
             'email': 'bob@example.com',
@@ -130,6 +145,7 @@ class AuthEndpointTests(ApiTestCase):
             'username': 'alice',
             'email': 'alice@example.com',
             'first_name': '',
+            'has_seen_onboarding': False,
         })
 
 
@@ -177,6 +193,7 @@ class UpdateProfileEndpointTests(ApiTestCase):
             'username': 'alice2',
             'email': 'alice2@example.com',
             'first_name': '',
+            'has_seen_onboarding': False,
         })
         self.user.refresh_from_db()
         self.assertEqual(self.user.username, 'alice2')
@@ -209,6 +226,17 @@ class UpdateProfileEndpointTests(ApiTestCase):
 
         self.assertEqual(response.status_code, 200)
 
+    def test_new_registration_defaults_has_seen_onboarding_to_false(self):
+        self.assertFalse(self.user.has_seen_onboarding)
+
+    def test_can_mark_onboarding_as_seen(self):
+        response = self._patch({'has_seen_onboarding': True})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()['has_seen_onboarding'])
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.has_seen_onboarding)
+
 
 class GoogleAuthEndpointTests(ApiTestCase):
     def _idinfo(self, **overrides):
@@ -231,6 +259,7 @@ class GoogleAuthEndpointTests(ApiTestCase):
         self.assertEqual(body['user']['email'], 'newuser@example.com')
         self.assertEqual(body['user']['username'], 'newuser')
         self.assertEqual(body['user']['first_name'], 'New')
+        self.assertFalse(body['user']['has_seen_onboarding'])
         self.assertIn('access', body)
         self.assertIn('refresh', body)
 
@@ -475,3 +504,133 @@ class AccountDeletionTests(ApiTestCase):
             self._delete({'username': 'alice'})
 
         mock_cleanup.assert_called_once_with([media.storage_key])
+
+
+class EmailVerificationTests(ApiTestCase):
+    def _register(self, mock_send, **overrides):
+        payload = {
+            'username': 'bob', 'email': 'bob@example.com',
+            'password': 'a-strong-password-123', 'first_name': 'Bob',
+        }
+        payload.update(overrides)
+        response = self.client.post('/api/auth/register/', payload)
+        uid, token = self._extract_uid_token(mock_send)
+        return response, uid, token
+
+    def _extract_uid_token(self, mock_send):
+        url = mock_send.call_args[0][1]
+        query = url.split('?', 1)[1]
+        params = dict(pair.split('=') for pair in query.split('&'))
+        return params['uid'], params['token']
+
+    @patch('accounts.services.send_verification_email')
+    def test_confirm_activates_account_and_login_then_works(self, mock_send):
+        _response, uid, token = self._register(mock_send)
+
+        confirm = self.client.post('/api/auth/verify-email/', {'uid': uid, 'token': token})
+
+        self.assertEqual(confirm.status_code, 200)
+        user = get_user_model().objects.get(username='bob')
+        self.assertTrue(user.is_active)
+
+        login = self.client.post('/api/auth/login/', {
+            'username': 'bob', 'password': 'a-strong-password-123',
+        })
+        self.assertEqual(login.status_code, 200)
+
+    @patch('accounts.services.send_verification_email')
+    def test_confirm_token_cannot_be_reused_after_activation(self, mock_send):
+        _response, uid, token = self._register(mock_send)
+
+        first = self.client.post('/api/auth/verify-email/', {'uid': uid, 'token': token})
+        second = self.client.post('/api/auth/verify-email/', {'uid': uid, 'token': token})
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 400)
+
+    @patch('accounts.services.send_verification_email')
+    def test_confirm_with_tampered_token_is_rejected(self, mock_send):
+        _response, uid, _token = self._register(mock_send)
+
+        confirm = self.client.post('/api/auth/verify-email/', {'uid': uid, 'token': 'not-a-real-token'})
+
+        self.assertEqual(confirm.status_code, 400)
+        user = get_user_model().objects.get(username='bob')
+        self.assertFalse(user.is_active)
+
+    @patch('accounts.services.send_password_reset_email')
+    @patch('accounts.services.send_verification_email')
+    def test_verification_and_password_reset_tokens_are_not_interchangeable(self, mock_verify, mock_reset):
+        _response, verify_uid, verify_token = self._register(mock_verify)
+        # Force-activate so a password-reset request is meaningful.
+        get_user_model().objects.filter(username='bob').update(is_active=True)
+
+        self.client.post('/api/auth/password-reset/', {'email': 'bob@example.com'})
+        reset_url = mock_reset.call_args[0][1]
+        reset_params = dict(pair.split('=') for pair in reset_url.split('?', 1)[1].split('&'))
+
+        # A verification token must not work as a password-reset token...
+        reset_attempt = self.client.post('/api/auth/password-reset/confirm/', {
+            'uid': verify_uid, 'token': verify_token, 'new_password': 'another-password-456',
+        })
+        self.assertEqual(reset_attempt.status_code, 400)
+
+        # ...and a password-reset token must not work as a verification token.
+        verify_attempt = self.client.post('/api/auth/verify-email/', {
+            'uid': reset_params['uid'], 'token': reset_params['token'],
+        })
+        self.assertEqual(verify_attempt.status_code, 400)
+
+    @patch('accounts.services.send_verification_email')
+    def test_reclaims_stale_unverified_signup(self, mock_send):
+        stale = get_user_model().objects.create_user(
+            username='bob', email='bob@example.com', password='old-password-123', is_active=False,
+        )
+        get_user_model().objects.filter(pk=stale.pk).update(
+            date_joined=timezone.now() - timedelta(hours=25),
+        )
+
+        response, _uid, _token = self._register(mock_send)
+
+        self.assertEqual(response.status_code, 201)
+        self.assertFalse(get_user_model().objects.filter(pk=stale.pk).exists())
+        self.assertTrue(get_user_model().objects.filter(username='bob').exists())
+
+    def test_does_not_reclaim_fresh_unverified_signup(self):
+        get_user_model().objects.create_user(
+            username='bob', email='bob@example.com', password='old-password-123', is_active=False,
+        )
+
+        response = self.client.post('/api/auth/register/', {
+            'username': 'bob', 'email': 'bob@example.com',
+            'password': 'a-strong-password-123', 'first_name': 'Bob',
+        })
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch('accounts.services.send_verification_email')
+    def test_resend_is_silent_for_unknown_email(self, mock_send):
+        response = self.client.post('/api/auth/verify-email/resend/', {'email': 'nobody@example.com'})
+
+        self.assertEqual(response.status_code, 200)
+        mock_send.assert_not_called()
+
+    @patch('accounts.services.send_verification_email')
+    def test_resend_is_silent_for_already_verified_email(self, mock_send):
+        get_user_model().objects.create_user(
+            username='bob', email='bob@example.com', password='a-strong-password-123',
+        )
+
+        response = self.client.post('/api/auth/verify-email/resend/', {'email': 'bob@example.com'})
+
+        self.assertEqual(response.status_code, 200)
+        mock_send.assert_not_called()
+
+    @patch('accounts.services.send_verification_email')
+    def test_resend_sends_again_for_pending_signup(self, mock_send):
+        self._register(mock_send)
+
+        response = self.client.post('/api/auth/verify-email/resend/', {'email': 'bob@example.com'})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(mock_send.call_count, 2)
