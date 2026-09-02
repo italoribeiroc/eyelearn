@@ -1,7 +1,10 @@
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import anthropic
+import groq
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 
@@ -10,14 +13,32 @@ from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from billing.models import PaymentCustomer, Subscription
-from flashcards.models import Collection, CollectionGoal, Flashcard, FlashcardMedia, ReviewLog, ReviewState, StudyDay
+from flashcards import ai_generation
+from flashcards.ai_providers import generate_with_fallback
+from flashcards.ai_providers.base import BasicCardAutoBatch, BasicCardBatch, ProviderUnavailableError
+from flashcards.models import (
+    Collection,
+    CollectionGoal,
+    Flashcard,
+    FlashcardGenerationDraft,
+    FlashcardMedia,
+    ReviewLog,
+    ReviewState,
+    StudyDay,
+)
 from flashcards.services import (
+    AI_GENERATION_BATCH_SIZE,
+    AiFlashcardGenerationService,
     CollectionCycleError,
     CollectionService,
     CrossOwnerParentError,
     FREE_FLASHCARD_LIMIT,
     FlashcardService,
     GoalService,
+    MAX_AI_GENERATE_COUNT,
+    MAX_AI_REGENERATE_COUNT,
+    MAX_EXISTING_CARDS_CONTEXT,
+    MAX_LEARNING_REQUEST_LENGTH,
     ReviewService,
     StreakService,
 )
@@ -42,6 +63,21 @@ def _make_flashcard(collection, card_type=Flashcard.CardType.BASIC, **kwargs):
 def _auth_headers(user):
     token = str(RefreshToken.for_user(user).access_token)
     return {'HTTP_AUTHORIZATION': f'Bearer {token}'}
+
+
+def _make_pro_user(username='alice', email='alice@example.com'):
+    user = _make_user(username=username, email=email)
+    customer = PaymentCustomer.objects.create(user=user, provider_customer_id=f'cus_{username}')
+    Subscription.objects.create(
+        customer=customer, provider_subscription_id=f'sub_{username}', provider_price_id='price_test',
+        plan=Subscription.Plan.MONTHLY, currency='usd', status=Subscription.Status.ACTIVE,
+    )
+    return user
+
+
+def _basic_draft_cards(count, prefix='Q'):
+    from flashcards.ai_providers.base import BasicCardDraft
+    return [BasicCardDraft(prompt=f'{prefix}{i}?', answer=f'A{i}') for i in range(count)]
 
 
 class CollectionCRUDTests(ApiTestCase):
@@ -817,3 +853,632 @@ class GoalsSummaryEndpointTests(ApiTestCase):
         self.assertEqual(body['active_goals'][0]['collection_name'], self.collection.name)
         self.assertEqual(body['daily_due_count'], 1)
         self.assertEqual(body['daily_target_total'], 1)
+
+
+class AiGenerationEndpointTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    def _generate(self, payload=None, headers=None):
+        payload = payload or {'card_type': 'basic', 'count': 3, 'learning_request': 'Learn about photosynthesis'}
+        return self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/ai-generate/',
+            data=json.dumps(payload), content_type='application/json', **(headers or self.headers),
+        )
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_non_pro_user_gets_402(self, mock_generate):
+        free_user = _make_user(username='free', email='free@example.com')
+        collection = _make_collection(free_user)
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{collection.id}/ai-generate/',
+            data=json.dumps({'card_type': 'basic', 'count': 3, 'learning_request': 'x'}),
+            content_type='application/json', **_auth_headers(free_user),
+        )
+
+        self.assertEqual(response.status_code, 402)
+        mock_generate.assert_not_called()
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_pro_user_generates_draft(self, mock_generate):
+        mock_generate.return_value = _basic_draft_cards(3)
+
+        response = self._generate()
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['card_type'], 'basic')
+        self.assertEqual(body['status'], 'pending')
+        self.assertEqual([c['id'] for c in body['cards']], [1, 2, 3])
+        self.assertEqual(body['cards'][0]['prompt'], 'Q0?')
+        self.assertTrue(FlashcardGenerationDraft.objects.filter(id=body['id'], user=self.user).exists())
+
+    @patch('flashcards.ai_providers.claude_provider.ClaudeProvider.generate')
+    def test_generate_response_reports_provider_used_header(self, mock_claude):
+        # X-AI-Provider is a developer-only signal (never rendered anywhere
+        # in the frontend) for checking which provider actually served a
+        # given call -- exercised through the real generate_with_fallback
+        # orchestration here (mocking the provider itself, not
+        # ai_generation.generate_cards), so it reflects the real code path.
+        mock_claude.return_value = BasicCardBatch(cards=[{'prompt': 'Q', 'answer': 'A'}])
+
+        response = self._generate({'card_type': 'basic', 'count': 1, 'learning_request': 'Learn about photosynthesis'})
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response['X-AI-Provider'], 'claude')
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_count_over_max_is_rejected(self, mock_generate):
+        response = self._generate({
+            'card_type': 'basic', 'count': MAX_AI_GENERATE_COUNT + 1, 'learning_request': 'x',
+        })
+
+        self.assertEqual(response.status_code, 400)
+        mock_generate.assert_not_called()
+        self.assertFalse(FlashcardGenerationDraft.objects.exists())
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_learning_request_too_long_is_rejected(self, mock_generate):
+        response = self._generate({
+            'card_type': 'basic', 'count': 3, 'learning_request': 'x' * (MAX_LEARNING_REQUEST_LENGTH + 1),
+        })
+
+        self.assertEqual(response.status_code, 400)
+        mock_generate.assert_not_called()
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_generating_again_discards_prior_pending_draft(self, mock_generate):
+        mock_generate.return_value = _basic_draft_cards(2)
+        first = self._generate().json()
+
+        mock_generate.return_value = _basic_draft_cards(2)
+        second = self._generate().json()
+
+        self.assertNotEqual(first['id'], second['id'])
+        self.assertFalse(FlashcardGenerationDraft.objects.filter(id=first['id']).exists())
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_claude_error_surfaces_as_502(self, mock_generate):
+        mock_generate.side_effect = ai_generation.AiGenerationError('boom')
+
+        response = self._generate()
+
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(FlashcardGenerationDraft.objects.exists())
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_count_above_batch_size_only_generates_first_batch(self, mock_generate):
+        requested = AI_GENERATION_BATCH_SIZE + 10
+        mock_generate.return_value = _basic_draft_cards(AI_GENERATION_BATCH_SIZE)
+
+        response = self._generate({'card_type': 'basic', 'count': requested, 'learning_request': 'x'})
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['target_count'], requested)
+        self.assertEqual(len(body['cards']), AI_GENERATION_BATCH_SIZE)
+        self.assertEqual(body['status'], 'pending')
+        mock_generate.assert_called_once()
+        self.assertEqual(mock_generate.call_args.kwargs['count'], AI_GENERATION_BATCH_SIZE)
+
+    @patch('flashcards.ai_generation.generate_auto_cards')
+    def test_auto_mode_uses_model_recommended_total(self, mock_auto):
+        mock_auto.return_value = BasicCardAutoBatch(
+            recommended_total=37, cards=[{'prompt': f'Q{i}', 'answer': f'A{i}'} for i in range(5)],
+        )
+
+        response = self._generate({'card_type': 'basic', 'auto': True, 'learning_request': 'x'})
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['target_count'], 37)
+        self.assertEqual(len(body['cards']), 5)
+        mock_auto.assert_called_once()
+        self.assertEqual(mock_auto.call_args.kwargs['max_first_batch'], AI_GENERATION_BATCH_SIZE)
+
+    @patch('flashcards.ai_generation.generate_auto_cards')
+    def test_auto_mode_target_never_smaller_than_first_batch(self, mock_auto):
+        # A deliberately-inconsistent model response (says 5 but returns 8)
+        # shouldn't leave target_count smaller than what's already generated.
+        mock_auto.return_value = BasicCardAutoBatch(
+            recommended_total=5, cards=[{'prompt': f'Q{i}', 'answer': f'A{i}'} for i in range(8)],
+        )
+
+        response = self._generate({'card_type': 'basic', 'auto': True, 'learning_request': 'x'})
+
+        self.assertEqual(response.json()['target_count'], 8)
+
+
+class AiGenerationBatchContinuationTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+        self.target_count = AI_GENERATION_BATCH_SIZE + 10
+        self.draft = FlashcardGenerationDraft.objects.create(
+            user=self.user, collection=self.collection, card_type=Flashcard.CardType.BASIC,
+            learning_request='Learn X', target_count=self.target_count,
+            cards=[
+                {'id': i, 'prompt': f'Q{i}', 'answer': f'A{i}', 'options': [], 'accepted_answers': []}
+                for i in range(1, AI_GENERATION_BATCH_SIZE + 1)
+            ],
+        )
+
+    def _continue(self):
+        return self.client.post(
+            f'/api/flashcards/ai-generate/{self.draft.id}/generate-next-batch/', **self.headers,
+        )
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_continues_toward_target_with_ids_after_existing(self, mock_generate):
+        remaining = self.target_count - AI_GENERATION_BATCH_SIZE  # 10, safely under one batch
+        mock_generate.return_value = _basic_draft_cards(remaining, prefix='NEW')
+
+        response = self._continue()
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body['cards']), self.target_count)
+        new_ids = [c['id'] for c in body['cards'][AI_GENERATION_BATCH_SIZE:]]
+        self.assertEqual(new_ids, list(range(AI_GENERATION_BATCH_SIZE + 1, self.target_count + 1)))
+        mock_generate.assert_called_once()
+        self.assertEqual(mock_generate.call_args.kwargs['count'], remaining)
+        # Dedup context includes what's already in the draft, not just
+        # persisted collection cards.
+        self.assertIn('Q1', mock_generate.call_args.kwargs['existing_card_prompts'])
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_batch_capped_at_ai_generation_batch_size(self, mock_generate):
+        self.draft.target_count = 500
+        self.draft.save(update_fields=['target_count'])
+        mock_generate.return_value = _basic_draft_cards(AI_GENERATION_BATCH_SIZE, prefix='NEW')
+
+        self._continue()
+
+        self.assertEqual(mock_generate.call_args.kwargs['count'], AI_GENERATION_BATCH_SIZE)
+
+    def test_already_complete_draft_is_400(self):
+        self.draft.target_count = AI_GENERATION_BATCH_SIZE
+        self.draft.save(update_fields=['target_count'])
+
+        response = self._continue()
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_pro_user_gets_402(self):
+        free_user = _make_user(username='free', email='free@example.com')
+        draft = FlashcardGenerationDraft.objects.create(
+            user=free_user, collection=_make_collection(free_user), card_type=Flashcard.CardType.BASIC,
+            learning_request='x', target_count=50, cards=[],
+        )
+
+        response = self.client.post(
+            f'/api/flashcards/ai-generate/{draft.id}/generate-next-batch/', **_auth_headers(free_user),
+        )
+
+        self.assertEqual(response.status_code, 402)
+
+    def test_other_users_draft_404s(self):
+        other = _make_user(username='bob', email='bob@example.com')
+
+        response = self.client.post(
+            f'/api/flashcards/ai-generate/{self.draft.id}/generate-next-batch/', **_auth_headers(other),
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_batch_dropped_if_draft_confirmed_while_generating(self, mock_generate):
+        # The AI call is slow and unlocked -- simulate a concurrent request
+        # (e.g. the user hit Save on the review page) completing while it
+        # was still in flight, by mutating the draft from inside the mock.
+        def fake_generate(**kwargs):
+            self.draft.status = FlashcardGenerationDraft.Status.CONFIRMED
+            self.draft.save(update_fields=['status'])
+            return _basic_draft_cards(5, prefix='NEW')
+
+        mock_generate.side_effect = fake_generate
+
+        response = self._continue()
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['status'], 'confirmed')
+        # The batch generated during the race is dropped, not appended to
+        # an already-confirmed draft.
+        self.assertEqual(len(body['cards']), AI_GENERATION_BATCH_SIZE)
+
+
+class AiProviderFallbackTests(TestCase):
+    """generate_with_fallback (the Claude -> Gemini -> Groq orchestration)
+    tested directly against mocked providers -- no real API calls."""
+
+    @patch('flashcards.ai_providers.groq_provider.GroqProvider.generate')
+    @patch('flashcards.ai_providers.gemini_provider.GeminiProvider.generate')
+    @patch('flashcards.ai_providers.claude_provider.ClaudeProvider.generate')
+    def test_falls_back_to_gemini_when_claude_unavailable(self, mock_claude, mock_gemini, mock_groq):
+        mock_claude.side_effect = ProviderUnavailableError('rate limited')
+        mock_gemini.return_value = BasicCardBatch(cards=[{'prompt': 'Q', 'answer': 'A'}])
+
+        result = generate_with_fallback(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+        self.assertEqual(len(result.cards), 1)
+        mock_claude.assert_called_once()
+        mock_gemini.assert_called_once()
+        mock_groq.assert_not_called()
+
+    @patch('flashcards.ai_providers.groq_provider.GroqProvider.generate')
+    @patch('flashcards.ai_providers.gemini_provider.GeminiProvider.generate')
+    @patch('flashcards.ai_providers.claude_provider.ClaudeProvider.generate')
+    def test_falls_back_to_groq_when_claude_and_gemini_unavailable(self, mock_claude, mock_gemini, mock_groq):
+        mock_claude.side_effect = ProviderUnavailableError('rate limited')
+        mock_gemini.side_effect = ProviderUnavailableError('rate limited')
+        mock_groq.return_value = BasicCardBatch(cards=[{'prompt': 'Q', 'answer': 'A'}])
+
+        result = generate_with_fallback(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+        self.assertEqual(len(result.cards), 1)
+        mock_claude.assert_called_once()
+        mock_gemini.assert_called_once()
+        mock_groq.assert_called_once()
+
+    @patch('flashcards.ai_providers.groq_provider.GroqProvider.generate')
+    @patch('flashcards.ai_providers.gemini_provider.GeminiProvider.generate')
+    @patch('flashcards.ai_providers.claude_provider.ClaudeProvider.generate')
+    def test_does_not_fall_back_on_claude_success(self, mock_claude, mock_gemini, mock_groq):
+        mock_claude.return_value = BasicCardBatch(cards=[{'prompt': 'Q', 'answer': 'A'}])
+
+        generate_with_fallback(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+        mock_gemini.assert_not_called()
+        mock_groq.assert_not_called()
+
+    @patch('flashcards.ai_providers.groq_provider.GroqProvider.generate')
+    @patch('flashcards.ai_providers.gemini_provider.GeminiProvider.generate')
+    @patch('flashcards.ai_providers.claude_provider.ClaudeProvider.generate')
+    def test_raises_when_every_provider_unavailable(self, mock_claude, mock_gemini, mock_groq):
+        mock_claude.side_effect = ProviderUnavailableError('rate limited')
+        mock_gemini.side_effect = ProviderUnavailableError('also unavailable')
+        mock_groq.side_effect = ProviderUnavailableError('also unavailable')
+
+        with self.assertRaises(ai_generation.AiGenerationError):
+            generate_with_fallback(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    @patch('flashcards.ai_providers.groq_provider.GroqProvider.generate')
+    @patch('flashcards.ai_providers.gemini_provider.GeminiProvider.generate')
+    @patch('flashcards.ai_providers.claude_provider.ClaudeProvider.generate')
+    def test_does_not_fall_back_on_claude_content_error(self, mock_claude, mock_gemini, mock_groq):
+        # A genuine validation/content failure isn't "unavailable" -- it
+        # would likely fail identically on the next provider too, so it
+        # should surface immediately rather than trying Gemini/Groq.
+        mock_claude.side_effect = ai_generation.AiGenerationError('schema mismatch')
+
+        with self.assertRaises(ai_generation.AiGenerationError):
+            generate_with_fallback(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+        mock_gemini.assert_not_called()
+        mock_groq.assert_not_called()
+
+    def test_claude_provider_unavailable_when_key_unset(self):
+        from flashcards.ai_providers.claude_provider import ClaudeProvider
+        with self.settings(CLAUDE_API_KEY=''):
+            with self.assertRaises(ProviderUnavailableError):
+                ClaudeProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    @patch('anthropic.resources.messages.Messages.parse')
+    def test_claude_insufficient_credit_balance_falls_back(self, mock_parse):
+        # Anthropic reports an exhausted credit balance as a plain 400
+        # invalid_request_error, not 429/402 -- must still be treated as
+        # "unavailable" (try Gemini next), not a terminal error, since a
+        # 400 alone would otherwise look like a malformed request.
+        import httpx2
+        from flashcards.ai_providers.claude_provider import ClaudeProvider
+
+        response = httpx2.Response(400, request=httpx2.Request('POST', 'https://api.anthropic.com/v1/messages'))
+        mock_parse.side_effect = anthropic.APIStatusError(
+            'bad request', response=response,
+            body={'type': 'error', 'error': {
+                'type': 'invalid_request_error',
+                'message': 'Your credit balance is too low to access the Anthropic API.',
+            }},
+        )
+
+        with self.settings(CLAUDE_API_KEY='sk-ant-test'):
+            with self.assertRaises(ProviderUnavailableError):
+                ClaudeProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    @patch('anthropic.resources.messages.Messages.parse')
+    def test_claude_genuine_bad_request_does_not_fall_back(self, mock_parse):
+        import httpx2
+
+        response = httpx2.Response(400, request=httpx2.Request('POST', 'https://api.anthropic.com/v1/messages'))
+        mock_parse.side_effect = anthropic.APIStatusError(
+            'bad request', response=response,
+            body={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'model: field required'}},
+        )
+
+        from flashcards.ai_providers.claude_provider import ClaudeProvider
+        with self.settings(CLAUDE_API_KEY='sk-ant-test'):
+            with self.assertRaises(ai_generation.AiGenerationError):
+                ClaudeProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    def test_gemini_provider_unavailable_when_key_unset(self):
+        from flashcards.ai_providers.gemini_provider import GeminiProvider
+        with self.settings(GEMINI_API_KEY=''):
+            with self.assertRaises(ProviderUnavailableError):
+                GeminiProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    def test_groq_provider_unavailable_when_key_unset(self):
+        from flashcards.ai_providers.groq_provider import GroqProvider
+        with self.settings(GROQ_API_KEY=''):
+            with self.assertRaises(ProviderUnavailableError):
+                GroqProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    @patch('groq.resources.chat.completions.Completions.create')
+    def test_groq_parses_valid_json_object_response(self, mock_create):
+        from flashcards.ai_providers.groq_provider import GroqProvider
+
+        mock_create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps({'cards': [{'prompt': 'Q', 'answer': 'A'}]}),
+            ))],
+        )
+
+        with self.settings(GROQ_API_KEY='gsk-test'):
+            result = GroqProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+        self.assertEqual(len(result.cards), 1)
+        self.assertEqual(result.cards[0].prompt, 'Q')
+
+    @patch('groq.resources.chat.completions.Completions.create')
+    def test_groq_malformed_json_is_ai_generation_error(self, mock_create):
+        # A response that isn't valid JSON, or doesn't match the schema, is
+        # a genuine content failure -- surfaced as AiGenerationError (not
+        # ProviderUnavailableError), since json_object mode gives no
+        # structural guarantee the way Claude/Gemini's native structured
+        # output does (see groq_provider.py's module docstring).
+        from flashcards.ai_providers.groq_provider import GroqProvider
+
+        mock_create.return_value = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='not valid json'))],
+        )
+
+        with self.settings(GROQ_API_KEY='gsk-test'):
+            with self.assertRaises(ai_generation.AiGenerationError):
+                GroqProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    @patch('groq.resources.chat.completions.Completions.create')
+    def test_groq_rate_limit_falls_back(self, mock_create):
+        import httpx
+        from flashcards.ai_providers.groq_provider import GroqProvider
+
+        response = httpx.Response(429, request=httpx.Request('POST', 'https://api.groq.com/openai/v1/chat/completions'))
+        mock_create.side_effect = groq.RateLimitError('rate limited', response=response, body=None)
+
+        with self.settings(GROQ_API_KEY='gsk-test'):
+            with self.assertRaises(ProviderUnavailableError):
+                GroqProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+    @patch('groq.resources.chat.completions.Completions.create')
+    def test_groq_bad_request_does_not_fall_back(self, mock_create):
+        import httpx
+        from flashcards.ai_providers.groq_provider import GroqProvider
+
+        response = httpx.Response(400, request=httpx.Request('POST', 'https://api.groq.com/openai/v1/chat/completions'))
+        mock_create.side_effect = groq.APIStatusError(
+            'bad request', response=response, body={'error': {'message': 'model: field required'}},
+        )
+
+        with self.settings(GROQ_API_KEY='gsk-test'):
+            with self.assertRaises(ai_generation.AiGenerationError):
+                GroqProvider().generate(system='sys', user_content='usr', response_model=BasicCardBatch)
+
+
+class AiGenerationDraftMutationTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+        self.draft = FlashcardGenerationDraft.objects.create(
+            user=self.user, collection=self.collection, card_type=Flashcard.CardType.BASIC,
+            learning_request='Learn X',
+            cards=[
+                {'id': 1, 'prompt': 'Q1', 'answer': 'A1', 'options': [], 'accepted_answers': []},
+                {'id': 2, 'prompt': 'Q2', 'answer': 'A2', 'options': [], 'accepted_answers': []},
+                {'id': 3, 'prompt': 'Q3', 'answer': 'A3', 'options': [], 'accepted_answers': []},
+            ],
+        )
+
+    def _post(self, path, payload):
+        return self.client.post(
+            f'/api/flashcards/ai-generate/{self.draft.id}/{path}',
+            data=json.dumps(payload), content_type='application/json', **self.headers,
+        )
+
+    def test_get_draft(self):
+        response = self.client.get(f'/api/flashcards/ai-generate/{self.draft.id}/', **self.headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()['cards']), 3)
+
+    def test_other_users_draft_404s(self):
+        other = _make_user(username='bob', email='bob@example.com')
+
+        response = self.client.get(f'/api/flashcards/ai-generate/{self.draft.id}/', **_auth_headers(other))
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('flashcards.ai_generation.regenerate_cards')
+    def test_regenerate_only_replaces_selected(self, mock_regenerate):
+        mock_regenerate.return_value = _basic_draft_cards(2, prefix='NEW')
+
+        response = self._post('regenerate/', {'selected_ids': [1, 3], 'instruction': 'Make harder'})
+
+        self.assertEqual(response.status_code, 200)
+        cards = {c['id']: c for c in response.json()['cards']}
+        self.assertEqual(cards[1]['prompt'], 'NEW0?')
+        self.assertEqual(cards[3]['prompt'], 'NEW1?')
+        # The non-selected card is left completely untouched.
+        self.assertEqual(cards[2], {'id': 2, 'prompt': 'Q2', 'answer': 'A2', 'options': [], 'accepted_answers': []})
+
+    @patch('flashcards.ai_generation.regenerate_cards')
+    def test_regenerate_claude_error_leaves_draft_unchanged(self, mock_regenerate):
+        mock_regenerate.side_effect = ai_generation.AiGenerationError('wrong count')
+
+        response = self._post('regenerate/', {'selected_ids': [1], 'instruction': 'x'})
+
+        self.assertEqual(response.status_code, 502)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.cards[0]['prompt'], 'Q1')
+
+    @patch('flashcards.ai_generation.regenerate_cards')
+    def test_regenerate_skips_concurrently_removed_card(self, mock_regenerate):
+        # Simulate a concurrent remove-cards call finishing while the (slow,
+        # unlocked) regenerate call for card 2 was still in flight.
+        def fake_regenerate(**kwargs):
+            self.draft.cards = [c for c in self.draft.cards if c['id'] != 2]
+            self.draft.save(update_fields=['cards'])
+            return _basic_draft_cards(2, prefix='NEW')
+
+        mock_regenerate.side_effect = fake_regenerate
+
+        response = self._post('regenerate/', {'selected_ids': [1, 2], 'instruction': 'x'})
+
+        self.assertEqual(response.status_code, 200)
+        ids = [c['id'] for c in response.json()['cards']]
+        self.assertNotIn(2, ids)
+        self.assertIn(1, ids)
+        self.assertIn(3, ids)
+
+    def test_regenerate_over_max_selected_is_400(self):
+        response = self._post('regenerate/', {
+            'selected_ids': list(range(1, MAX_AI_REGENERATE_COUNT + 2)), 'instruction': 'x',
+        })
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_regenerate_empty_selection_is_400(self):
+        response = self._post('regenerate/', {'selected_ids': [], 'instruction': 'x'})
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_regenerate_unknown_id_is_400(self):
+        response = self._post('regenerate/', {'selected_ids': [999], 'instruction': 'x'})
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_regenerate_on_non_pending_draft_is_400(self):
+        self.draft.status = FlashcardGenerationDraft.Status.CONFIRMED
+        self.draft.save()
+
+        response = self._post('regenerate/', {'selected_ids': [1], 'instruction': 'x'})
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_remove_cards(self):
+        response = self._post('remove-cards/', {'card_ids': [2]})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([c['id'] for c in response.json()['cards']], [1, 3])
+        self.draft.refresh_from_db()
+        self.assertEqual([c['id'] for c in self.draft.cards], [1, 3])
+
+    def test_remove_cards_on_confirmed_draft_is_400(self):
+        self.draft.status = FlashcardGenerationDraft.Status.CONFIRMED
+        self.draft.save()
+
+        response = self._post('remove-cards/', {'card_ids': [1]})
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_creates_real_flashcards(self):
+        response = self._post('confirm/', {})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body['created']), 3)
+        self.assertEqual(body['errors'], [])
+        self.assertEqual(Flashcard.objects.filter(collection=self.collection).count(), 3)
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, FlashcardGenerationDraft.Status.CONFIRMED)
+
+    def test_confirm_twice_is_400(self):
+        self._post('confirm/', {})
+
+        response = self._post('confirm/', {})
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_confirm_partial_failure_still_creates_valid_cards(self):
+        self.draft.cards[1]['prompt'] = ''  # blank prompt fails FlashcardSerializer validation
+        self.draft.save(update_fields=['cards'])
+
+        response = self._post('confirm/', {})
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body['created']), 2)
+        self.assertEqual(len(body['errors']), 1)
+        self.assertEqual(body['errors'][0]['id'], 2)
+        self.assertEqual(Flashcard.objects.filter(collection=self.collection).count(), 2)
+
+    def test_discard(self):
+        response = self._post('discard/', {})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['status'], 'discarded')
+        self.draft.refresh_from_db()
+        self.assertEqual(self.draft.status, FlashcardGenerationDraft.Status.DISCARDED)
+
+    def test_discard_confirmed_draft_is_400(self):
+        self.draft.status = FlashcardGenerationDraft.Status.CONFIRMED
+        self.draft.save()
+
+        response = self._post('discard/', {})
+
+        self.assertEqual(response.status_code, 400)
+
+
+class AiFlashcardGenerationServiceUnitTests(TestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.collection = _make_collection(self.user)
+        self.service = AiFlashcardGenerationService()
+
+    def test_existing_card_prompts_capped_and_prefers_recent(self):
+        for i in range(MAX_EXISTING_CARDS_CONTEXT + 10):
+            _make_flashcard(self.collection, prompt=f'q{i}')
+
+        prompts = self.service._existing_card_prompts(self.collection)
+
+        self.assertEqual(len(prompts), MAX_EXISTING_CARDS_CONTEXT)
+        self.assertNotIn('q0', prompts)
+        self.assertIn(f'q{MAX_EXISTING_CARDS_CONTEXT + 9}', prompts)
+
+    def test_learning_context_empty_collection(self):
+        context = self.service._build_learning_context(user=self.user, collection=self.collection)
+
+        self.assertIn('no existing flashcards', context)
+
+    def test_learning_context_unstudied_cards(self):
+        _make_flashcard(self.collection)
+
+        context = self.service._build_learning_context(user=self.user, collection=self.collection)
+
+        self.assertIn('none of which the user has studied', context)
+
+    def test_learning_context_reflects_review_states(self):
+        card = _make_flashcard(self.collection)
+        ReviewState.objects.create(
+            user=self.user, flashcard=card, due=timezone.now(),
+            state=ReviewState.State.REVIEW, reps=3, lapses=1,
+        )
+
+        context = self.service._build_learning_context(user=self.user, collection=self.collection)
+
+        self.assertIn('0 never studied', context)
+        self.assertIn('1 mastered/in regular review', context)
+        self.assertIn('1 total lapses', context)

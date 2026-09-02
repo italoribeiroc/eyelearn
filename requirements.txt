@@ -10,3 +10,7 @@ requests==2.34.2
 stripe==15.5.1
 boto3==1.43.78
 fsrs==6.3.2
+anthropic==1.2.0
+pydantic==2.13.5
+google-genai==2.20.0
+groq==1.7.0

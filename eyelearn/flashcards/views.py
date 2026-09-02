@@ -1,15 +1,22 @@
 from datetime import timedelta
 
+from django.db import transaction
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 
-from .models import Collection, CollectionGoal, Flashcard, FlashcardMedia
+from .ai_generation import AiGenerationError
+from .ai_providers import pop_last_provider_used
+from .models import Collection, CollectionGoal, Flashcard, FlashcardGenerationDraft, FlashcardMedia
 from .serializers import (
+    AiGenerationRequestSerializer,
+    AiRegenerateRequestSerializer,
+    AiRemoveCardsRequestSerializer,
     CollectionGoalSerializer,
     CollectionSerializer,
     FlashcardMediaSerializer,
@@ -19,6 +26,9 @@ from .serializers import (
     ReviewSubmissionSerializer,
 )
 from .services import (
+    AiFlashcardGenerationService,
+    AiGenerationNotAllowedError,
+    AiGenerationValidationError,
     CollectionCycleError,
     CollectionLimitError,
     CollectionService,
@@ -35,12 +45,65 @@ from .services import (
 STREAK_CALENDAR_MAX_RANGE_DAYS = 366
 
 
+class AiGenerationRateThrottle(UserRateThrottle):
+    scope = 'ai_flashcard_generation'
+
+
+class AiGenerationBatchRateThrottle(UserRateThrottle):
+    """Separate, more generous scope for generate-next-batch -- a single
+    large (up to 500-card) generation can legitimately need up to
+    MAX_AI_GENERATE_COUNT / AI_GENERATION_BATCH_SIZE calls (20), which would
+    exhaust the regular ai_flashcard_generation budget in one go."""
+    scope = 'ai_flashcard_generation_batch'
+
+
 def _user_collection_or_404(user, collection_id):
     return get_object_or_404(Collection, pk=collection_id, user=user)
 
 
 def _user_flashcard_or_404(user, flashcard_id):
     return get_object_or_404(Flashcard, pk=flashcard_id, collection__user=user)
+
+
+def _user_draft_or_404(user, draft_id):
+    return get_object_or_404(FlashcardGenerationDraft, pk=draft_id, user=user)
+
+
+def _user_draft_or_404_locked(user, draft_id):
+    """Same as _user_draft_or_404, but row-locked (must be called inside
+    transaction.atomic()). Background generation means generate-next-batch,
+    regenerate, remove-cards, confirm, and discard can now genuinely race
+    against each other for the same draft (e.g. the user removes a card
+    while a background batch is still landing) -- locking makes each
+    mutation's read-modify-write of `cards` atomic instead of last-write-wins.
+    """
+    return get_object_or_404(
+        FlashcardGenerationDraft.objects.select_for_update(), pk=draft_id, user=user,
+    )
+
+
+def _serialize_draft(draft):
+    return {
+        'id': draft.id,
+        'collection': draft.collection_id,
+        'card_type': draft.card_type,
+        'learning_request': draft.learning_request,
+        'status': draft.status,
+        'target_count': draft.target_count,
+        'cards': draft.cards,
+    }
+
+
+def _draft_response(draft, *, status_code=status.HTTP_200_OK):
+    """Wraps a successful draft response with an X-AI-Provider header
+    reporting which provider (claude/gemini/groq) actually served the AI
+    call this view just made -- a way for us to check which one is live in
+    a given environment (via curl/devtools, or a real Vercel request's
+    response headers in the logs) without adding anything a normal user
+    would ever notice; nothing in the UI reads or displays this header."""
+    response = Response(_serialize_draft(draft), status=status_code)
+    response['X-AI-Provider'] = pop_last_provider_used() or 'none'
+    return response
 
 
 @api_view(['GET', 'POST'])
@@ -311,3 +374,121 @@ def submit_review(request, flashcard_id):
         'reps': review_state.reps,
         'lapses': review_state.lapses,
     })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AiGenerationRateThrottle])
+def generate_flashcards(request, collection_id):
+    collection = _user_collection_or_404(request.user, collection_id)
+
+    serializer = AiGenerationRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        draft = AiFlashcardGenerationService().generate(
+            user=request.user, collection=collection, **serializer.validated_data,
+        )
+    except AiGenerationNotAllowedError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+    except AiGenerationValidationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except AiGenerationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return _draft_response(draft, status_code=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AiGenerationBatchRateThrottle])
+def generate_next_batch(request, draft_id):
+    draft = _user_draft_or_404(request.user, draft_id)
+
+    try:
+        draft = AiFlashcardGenerationService().generate_next_batch(user=request.user, draft=draft)
+    except AiGenerationNotAllowedError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+    except AiGenerationValidationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except AiGenerationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return _draft_response(draft)
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def ai_generation_draft_detail(request, draft_id):
+    draft = _user_draft_or_404(request.user, draft_id)
+    return Response(_serialize_draft(draft))
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([AiGenerationRateThrottle])
+def regenerate_draft_cards(request, draft_id):
+    draft = _user_draft_or_404(request.user, draft_id)
+
+    serializer = AiRegenerateRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        draft = AiFlashcardGenerationService().regenerate(
+            user=request.user, draft=draft, **serializer.validated_data,
+        )
+    except AiGenerationNotAllowedError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+    except AiGenerationValidationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+    except AiGenerationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_502_BAD_GATEWAY)
+
+    return _draft_response(draft)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def remove_draft_cards(request, draft_id):
+    serializer = AiRemoveCardsRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        with transaction.atomic():
+            draft = _user_draft_or_404_locked(request.user, draft_id)
+            draft = AiFlashcardGenerationService().remove_cards(
+                user=request.user, draft=draft, **serializer.validated_data,
+            )
+    except AiGenerationValidationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(_serialize_draft(draft))
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def confirm_draft(request, draft_id):
+    try:
+        with transaction.atomic():
+            draft = _user_draft_or_404_locked(request.user, draft_id)
+            created, errors = AiFlashcardGenerationService().confirm(user=request.user, draft=draft)
+    except AiGenerationValidationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({
+        'created': FlashcardSerializer(created, many=True).data,
+        'errors': errors,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def discard_draft(request, draft_id):
+    try:
+        with transaction.atomic():
+            draft = _user_draft_or_404_locked(request.user, draft_id)
+            draft = AiFlashcardGenerationService().discard(user=request.user, draft=draft)
+    except AiGenerationValidationError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({'status': draft.status})
