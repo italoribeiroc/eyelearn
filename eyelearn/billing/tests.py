@@ -355,6 +355,25 @@ class StripeProviderTests(TestCase):
         from billing.providers.stripe_provider import StripeProvider
         return StripeProvider()
 
+    @patch('billing.providers.stripe_provider.stripe.Subscription.cancel')
+    def test_cancel_subscription_calls_stripe_cancel(self, mock_cancel):
+        self._provider().cancel_subscription(subscription_ref='sub_123')
+
+        mock_cancel.assert_called_once_with('sub_123')
+
+    @patch('billing.providers.stripe_provider.stripe.Subscription.cancel')
+    def test_cancel_subscription_swallows_stripe_error(self, mock_cancel):
+        # Best-effort by design (see cancel_subscription's docstring): used
+        # when an account is being deleted, so a Stripe-side failure (e.g.
+        # the subscription is already canceled/gone) must never propagate
+        # and block that deletion.
+        import stripe as stripe_sdk
+        mock_cancel.side_effect = stripe_sdk.error.InvalidRequestError(
+            "No such subscription: 'sub_123'", param='id', code='resource_missing',
+        )
+
+        self._provider().cancel_subscription(subscription_ref='sub_123')  # must not raise
+
     @patch('billing.providers.stripe_provider.stripe.checkout.Session.create')
     def test_create_checkout_session_raises_customer_not_found_when_stripe_rejects_customer(self, mock_create):
         import stripe as stripe_sdk
