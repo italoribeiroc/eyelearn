@@ -7,16 +7,37 @@ import fsrs
 from billing.models import get_active_subscription
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
+from django.db.models import Count, F, Sum
 from django.utils import timezone
 
-from . import storage
-from .models import Collection, CollectionGoal, Flashcard, FlashcardMedia, ReviewLog, ReviewState, StudyDay
+from . import ai_generation, storage
+from .models import (
+    Collection,
+    CollectionGoal,
+    Flashcard,
+    FlashcardGenerationDraft,
+    FlashcardMedia,
+    ReviewLog,
+    ReviewState,
+    StudyDay,
+)
 
 logger = logging.getLogger(__name__)
 
 FREE_COLLECTION_LIMIT = 3
 FREE_FLASHCARD_LIMIT = 300
+
+MAX_AI_GENERATE_COUNT = 500
+MAX_AI_REGENERATE_COUNT = 10
+MAX_LEARNING_REQUEST_LENGTH = 2000
+MAX_REGENERATE_INSTRUCTION_LENGTH = 1000
+MAX_EXISTING_CARDS_CONTEXT = 150
+# Cards requested per Claude/Gemini call. A single call can't safely produce
+# hundreds of cards' worth of output in one Vercel serverless request (see
+# AiFlashcardGenerationService.generate_next_batch), so anything above this
+# is filled by repeated, individually-bounded continuation calls instead of
+# one huge one.
+AI_GENERATION_BATCH_SIZE = 25
 
 
 class CollectionCycleError(Exception):
@@ -37,6 +58,14 @@ class FlashcardLimitError(Exception):
 
 class UnsupportedMediaError(Exception):
     """Raised when a requested content type/size isn't allowed for its media type."""
+
+
+class AiGenerationNotAllowedError(Exception):
+    """Raised when a non-Pro user calls generate/regenerate."""
+
+
+class AiGenerationValidationError(Exception):
+    """Raised for out-of-range count/length, or an invalid selected_ids/card_ids list."""
 
 
 ALLOWED_CONTENT_TYPES = {
@@ -134,6 +163,286 @@ class FlashcardService:
                 raise FlashcardLimitError(
                     f'Free plan is limited to {FREE_FLASHCARD_LIMIT} flashcards. Upgrade to Pro for unlimited flashcards.',
                 )
+
+
+class AiFlashcardGenerationService:
+    """AI flashcard generation is Pro-only, enforced here (not just hidden in
+    the UI) the same way FlashcardService.assert_can_create gates the free
+    flashcard limit -- a plain inline check, no dedicated permission class.
+    """
+
+    def assert_pro(self, *, user):
+        if get_active_subscription(user) is None:
+            raise AiGenerationNotAllowedError('AI flashcard generation is a Pro feature.')
+
+    def generate(self, *, user, collection, card_type, learning_request, count=None, auto=False):
+        self.assert_pro(user=user)
+        if not auto:
+            if not count or not (1 <= count <= MAX_AI_GENERATE_COUNT):
+                raise AiGenerationValidationError(f'count must be between 1 and {MAX_AI_GENERATE_COUNT}.')
+        learning_request = (learning_request or '').strip()
+        if not learning_request:
+            raise AiGenerationValidationError('learning_request is required.')
+        if len(learning_request) > MAX_LEARNING_REQUEST_LENGTH:
+            raise AiGenerationValidationError(
+                f'learning_request must be at most {MAX_LEARNING_REQUEST_LENGTH} characters.',
+            )
+
+        # Clean up any abandoned draft before starting a new one, so drafts
+        # don't pile up -- same "reclaim stale state" idea as
+        # accounts.services.EmailVerificationService.reclaim_stale_signup.
+        FlashcardGenerationDraft.objects.filter(
+            user=user, collection=collection, status=FlashcardGenerationDraft.Status.PENDING,
+        ).delete()
+
+        existing_prompts = self._existing_card_prompts(collection)
+        learning_context = self._build_learning_context(user=user, collection=collection)
+        collection_context = {'name': collection.name, 'description': collection.description}
+
+        if auto:
+            # The model decides the total; we only bound its first batch,
+            # not the total itself (that's clamped after the fact below).
+            result = ai_generation.generate_auto_cards(
+                card_type=card_type,
+                max_first_batch=AI_GENERATION_BATCH_SIZE,
+                learning_request=learning_request,
+                collection_context=collection_context,
+                existing_card_prompts=existing_prompts,
+                learning_context=learning_context,
+            )
+            cards = result.cards
+            # Never let the target be smaller than what was already
+            # generated, and never let a model-chosen total exceed our own
+            # hard ceiling.
+            target_count = max(len(cards), min(result.recommended_total, MAX_AI_GENERATE_COUNT))
+        else:
+            first_batch_count = min(count, AI_GENERATION_BATCH_SIZE)
+            cards = ai_generation.generate_cards(
+                card_type=card_type,
+                count=first_batch_count,
+                learning_request=learning_request,
+                collection_context=collection_context,
+                existing_card_prompts=existing_prompts,
+                learning_context=learning_context,
+            )
+            target_count = count
+
+        draft = FlashcardGenerationDraft.objects.create(
+            user=user,
+            collection=collection,
+            card_type=card_type,
+            learning_request=learning_request,
+            target_count=target_count,
+            cards=[self._draft_dict(index + 1, card_type, card) for index, card in enumerate(cards)],
+        )
+        return draft
+
+    def generate_next_batch(self, *, user, draft):
+        """Continues a generation that's larger than one Claude/Gemini call
+        can safely produce -- appends up to AI_GENERATION_BATCH_SIZE more
+        cards toward draft.target_count. Called repeatedly by the frontend
+        (not looped server-side) so each individual request stays short
+        regardless of how large the overall target is -- this app has no
+        background-job infrastructure to hand a long-running loop off to.
+
+        Runs the slow AI call with NO row lock held, so a concurrent
+        remove/regenerate/confirm/discard on the same draft (the user
+        interacting with cards already on the review page while this batch
+        is still generating in the background) is never blocked waiting on
+        it. Only the final splice-and-save is a short locked transaction.
+        """
+        self.assert_pro(user=user)
+        self._assert_pending(draft)
+
+        remaining = draft.target_count - len(draft.cards)
+        if remaining <= 0:
+            raise AiGenerationValidationError('This generation is already complete.')
+        batch_count = min(remaining, AI_GENERATION_BATCH_SIZE)
+
+        # Dedup context includes both this collection's persisted cards and
+        # everything generated in this draft so far, so later batches don't
+        # repeat earlier ones. A snapshot from just before the (slow) call is
+        # fine here -- staleness only means possibly-imperfect dedup context,
+        # never a lost write (the save below is what's locked).
+        existing_prompts = self._existing_card_prompts(draft.collection) + [
+            card['prompt'] for card in draft.cards
+        ]
+        learning_context = self._build_learning_context(user=user, collection=draft.collection)
+
+        cards = ai_generation.generate_cards(
+            card_type=draft.card_type,
+            count=batch_count,
+            learning_request=draft.learning_request,
+            collection_context={'name': draft.collection.name, 'description': draft.collection.description},
+            existing_card_prompts=existing_prompts,
+            learning_context=learning_context,
+            already_generated=len(draft.cards),
+            target_count=draft.target_count,
+        )
+
+        with transaction.atomic():
+            fresh = FlashcardGenerationDraft.objects.select_for_update().get(pk=draft.pk)
+            if fresh.status != FlashcardGenerationDraft.Status.PENDING:
+                # Confirmed or discarded while this batch was generating --
+                # drop the results rather than append to a draft that's no
+                # longer live.
+                return fresh
+            next_id = (max((card['id'] for card in fresh.cards), default=0)) + 1
+            new_dicts = [self._draft_dict(next_id + i, fresh.card_type, card) for i, card in enumerate(cards)]
+            fresh.cards = fresh.cards + new_dicts
+            fresh.save(update_fields=['cards', 'updated_at'])
+            return fresh
+
+    def regenerate(self, *, user, draft, selected_ids, instruction):
+        """Same "slow call unlocked, final write locked" shape as
+        generate_next_batch -- see its docstring."""
+        self.assert_pro(user=user)
+        self._assert_pending(draft)
+
+        if not selected_ids:
+            raise AiGenerationValidationError('Select at least one card to regenerate.')
+        if len(selected_ids) > MAX_AI_REGENERATE_COUNT:
+            raise AiGenerationValidationError(f'Select at most {MAX_AI_REGENERATE_COUNT} cards at once.')
+        instruction = (instruction or '').strip()
+        if not instruction:
+            raise AiGenerationValidationError('instruction is required.')
+        if len(instruction) > MAX_REGENERATE_INSTRUCTION_LENGTH:
+            raise AiGenerationValidationError(
+                f'instruction must be at most {MAX_REGENERATE_INSTRUCTION_LENGTH} characters.',
+            )
+
+        by_id = {card['id']: card for card in draft.cards}
+        if not set(selected_ids).issubset(by_id.keys()):
+            raise AiGenerationValidationError('selected_ids must refer to cards in this draft.')
+
+        cards_to_replace = [by_id[card_id] for card_id in selected_ids]
+        existing_prompts = self._existing_card_prompts(draft.collection)
+
+        new_cards = ai_generation.regenerate_cards(
+            card_type=draft.card_type,
+            learning_request=draft.learning_request,
+            current_draft_cards=draft.cards,
+            cards_to_replace=cards_to_replace,
+            existing_card_prompts=existing_prompts,
+            instruction=instruction,
+        )
+
+        with transaction.atomic():
+            fresh = FlashcardGenerationDraft.objects.select_for_update().get(pk=draft.pk)
+            if fresh.status != FlashcardGenerationDraft.Status.PENDING:
+                return fresh
+            fresh_by_id = {card['id']: card for card in fresh.cards}
+            # Splice replacements onto exactly the requested ids, in Python
+            # -- this (not the model) is what guarantees every other card is
+            # left completely untouched. A selected id that's since been
+            # removed (a concurrent remove-cards call) is simply skipped --
+            # nothing left to replace.
+            for card_id, new_card in zip(selected_ids, new_cards):
+                if card_id in fresh_by_id:
+                    fresh_by_id[card_id] = self._draft_dict(card_id, fresh.card_type, new_card)
+            fresh.cards = list(fresh_by_id.values())
+            fresh.save(update_fields=['cards', 'updated_at'])
+            return fresh
+
+    def remove_cards(self, *, user, draft, card_ids):
+        self._assert_pending(draft)
+        if not card_ids:
+            raise AiGenerationValidationError('card_ids is required.')
+        draft.cards = [card for card in draft.cards if card['id'] not in card_ids]
+        draft.save(update_fields=['cards', 'updated_at'])
+        return draft
+
+    def confirm(self, *, user, draft):
+        self._assert_pending(draft)
+        if not draft.cards:
+            raise AiGenerationValidationError('No cards left to save.')
+
+        # Deferred import: serializers.py imports ReviewService from this
+        # module, so a top-level import here would be circular.
+        from .serializers import FlashcardSerializer
+
+        created = []
+        errors = []
+        for card in draft.cards:
+            payload = {
+                'card_type': draft.card_type,
+                'prompt': card['prompt'],
+                'answer': card['answer'],
+                'options': card['options'],
+                'accepted_answers': card['accepted_answers'],
+            }
+            serializer = FlashcardSerializer(data=payload)
+            if not serializer.is_valid():
+                errors.append({'id': card['id'], 'errors': serializer.errors})
+                continue
+            try:
+                # Defensive: Pro always passes this, but a subscription could
+                # in principle lapse between generating and confirming.
+                FlashcardService().assert_can_create(user=user)
+            except FlashcardLimitError as exc:
+                errors.append({'id': card['id'], 'errors': {'detail': str(exc)}})
+                continue
+            created.append(serializer.save(collection=draft.collection))
+
+        draft.status = FlashcardGenerationDraft.Status.CONFIRMED
+        draft.save(update_fields=['status', 'updated_at'])
+        return created, errors
+
+    def discard(self, *, user, draft):
+        if draft.status == FlashcardGenerationDraft.Status.CONFIRMED:
+            raise AiGenerationValidationError('This generation was already saved.')
+        draft.status = FlashcardGenerationDraft.Status.DISCARDED
+        draft.save(update_fields=['status', 'updated_at'])
+        return draft
+
+    def _assert_pending(self, draft):
+        if draft.status != FlashcardGenerationDraft.Status.PENDING:
+            raise AiGenerationValidationError('This generation has already been saved or discarded.')
+
+    def _draft_dict(self, card_id, card_type, card):
+        if card_type == Flashcard.CardType.MULTIPLE_CHOICE:
+            options = [
+                {'text': option, 'is_correct': index == card.correct_option_index}
+                for index, option in enumerate(card.options)
+            ]
+            return {'id': card_id, 'prompt': card.prompt, 'answer': '', 'options': options, 'accepted_answers': []}
+        if card_type == Flashcard.CardType.TYPED_ANSWER:
+            return {
+                'id': card_id, 'prompt': card.prompt, 'answer': card.answer,
+                'options': [], 'accepted_answers': card.accepted_answers,
+            }
+        return {'id': card_id, 'prompt': card.prompt, 'answer': card.answer, 'options': [], 'accepted_answers': []}
+
+    def _existing_card_prompts(self, collection):
+        return list(
+            Flashcard.objects.filter(collection=collection)
+            .order_by('-created_at')
+            .values_list('prompt', flat=True)[:MAX_EXISTING_CARDS_CONTEXT]
+        )
+
+    def _build_learning_context(self, *, user, collection):
+        subtree_ids = CollectionService().get_subtree_ids(collection=collection)
+        total_cards = Flashcard.objects.filter(collection_id__in=subtree_ids).count()
+        if total_cards == 0:
+            return 'This collection has no existing flashcards yet.'
+
+        states = ReviewState.objects.filter(user=user, flashcard__collection_id__in=subtree_ids)
+        counts = {row['state']: row['n'] for row in states.values('state').annotate(n=Count('id'))}
+        reviewed_count = sum(counts.values())
+        if reviewed_count == 0:
+            return f'This collection has {total_cards} existing flashcards, none of which the user has studied yet.'
+
+        lapses_total = states.aggregate(total_lapses=Sum('lapses'))['total_lapses'] or 0
+        never_reviewed = max(total_cards - reviewed_count, 0)
+        learning = counts.get(ReviewState.State.NEW, 0) + counts.get(ReviewState.State.LEARNING, 0)
+        review = counts.get(ReviewState.State.REVIEW, 0)
+        relearning = counts.get(ReviewState.State.RELEARNING, 0)
+
+        return (
+            f'Of {total_cards} existing flashcards: {never_reviewed} never studied, {learning} still being '
+            f'learned, {review} mastered/in regular review, {relearning} being relearned after being '
+            f'forgotten ({lapses_total} total lapses across all reviews).'
+        )
 
 
 def _cleanup_storage_keys(storage_keys):

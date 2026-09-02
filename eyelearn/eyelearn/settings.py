@@ -74,6 +74,44 @@ RESEND_FROM_EMAIL = os.environ.get('RESEND_FROM_EMAIL', 'onboarding@resend.dev')
 # ContactMessage row and the submitter's confirmation email still go out).
 CONTACT_NOTIFICATION_EMAIL = os.environ.get('CONTACT_NOTIFICATION_EMAIL', '')
 
+# Used by flashcards/ai_providers/ for AI flashcard generation, a Pro-only
+# feature. Server-only, never exposed to the frontend -- same invariant as
+# STRIPE_SECRET_KEY/RESEND_API_KEY. Claude is tried first; if unavailable
+# (rate limited, overloaded, unreachable, or unset), Gemini is used as a
+# fallback, then Groq (see flashcards/ai_providers/__init__.py). Any of the
+# three can be left unset -- each provider treats a missing key as "I'm
+# unavailable" and the orchestrator just moves on to the next one.
+CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', '')
+GEMINI_API_KEY = os.environ.get('GEMINI_API_KEY', '')
+GROQ_API_KEY = os.environ.get('GROQ_API_KEY', '')
+
+# Without this, flashcards.ai_providers' logger.info() calls (recording
+# *which* provider served a generation, not just when one failed) are
+# silently dropped: Django's own default logging config only wires up
+# handlers for its own 'django'/'django.server' loggers, so a plain
+# logging.getLogger(__name__) in application code falls back to Python's
+# "handler of last resort", which only prints WARNING and above -- exactly
+# why only the "AI provider X unavailable" lines were ever visible in the
+# console/dev log, never the "AI provider X served this generation" one.
+# disable_existing_loggers=False keeps Django's own defaults (request logs,
+# etc.) untouched; this only adds a console handler for this one logger.
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'loggers': {
+        'flashcards.ai_providers': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+    },
+}
+
 # Shared secret the Next.js BFF attaches on every outbound call (see
 # eyelearn.middleware.InternalApiKeyMiddleware). Required in every
 # environment, including local dev -- generate one with
@@ -197,6 +235,11 @@ REST_FRAMEWORK = {
         'email_verification_confirm': '10/hour',
         'email_verification_resend': '5/hour',
         'contact_form': '5/hour',
+        'ai_flashcard_generation': '20/hour',
+        # More generous than ai_flashcard_generation: a single up-to-500-card
+        # generation legitimately needs up to MAX_AI_GENERATE_COUNT /
+        # AI_GENERATION_BATCH_SIZE continuation calls (20) on its own.
+        'ai_flashcard_generation_batch': '200/hour',
     },
     'DEFAULT_RENDERER_CLASSES': (
         ['rest_framework.renderers.JSONRenderer', 'rest_framework.renderers.BrowsableAPIRenderer']

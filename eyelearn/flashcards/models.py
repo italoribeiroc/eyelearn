@@ -155,6 +155,48 @@ class StudyDay(models.Model):
         return f'{self.user_id}:{self.date}'
 
 
+class FlashcardGenerationDraft(models.Model):
+    """A pending batch of AI-generated flashcards awaiting user review.
+
+    Persisted (rather than kept only in frontend state) because review lives
+    on its own page (see eyelearn-ui's ai-generate/<draftId> route) that must
+    survive a refresh or back-navigation. `cards` is a single JSON blob, not
+    a child row-per-card table, since nothing else in the schema ever needs
+    to query an individual draft card in isolation.
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'pending', 'Pending'
+        CONFIRMED = 'confirmed', 'Confirmed'
+        DISCARDED = 'discarded', 'Discarded'
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='flashcard_generation_drafts',
+    )
+    collection = models.ForeignKey(Collection, on_delete=models.CASCADE, related_name='generation_drafts')
+    card_type = models.CharField(max_length=20, choices=Flashcard.CardType.choices)
+    learning_request = models.TextField()
+    # Total the user asked for. A single Claude call is capped (see
+    # AI_GENERATION_BATCH_SIZE in services.py) so large requests are filled
+    # by repeated POST .../generate-next-batch/ calls, each appending a
+    # bounded chunk to `cards` -- generation is "complete" once
+    # len(cards) >= target_count.
+    target_count = models.PositiveIntegerField(default=0)
+    # Each item: {"id": int, "prompt": str, "answer": str, "options": [...], "accepted_answers": [...]}.
+    # "id" is a small per-draft counter (1, 2, 3, ...) assigned at generation time -- a stable
+    # identity for regenerate/remove requests that doesn't depend on array position.
+    cards = models.JSONField(default=list)
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.PENDING)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['user', 'collection', 'status'])]
+
+    def __str__(self):
+        return f'{self.user_id}:{self.collection_id} ({self.status}, {len(self.cards)} cards)'
+
+
 class ReviewLog(models.Model):
     class Rating(models.IntegerChoices):
         AGAIN = 1, 'Again'

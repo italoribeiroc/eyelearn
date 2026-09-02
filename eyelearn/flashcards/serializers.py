@@ -91,6 +91,25 @@ class CollectionGoalSerializer(serializers.ModelSerializer):
         fields = ['target_date']
 
 
+class AiGenerationRequestSerializer(serializers.Serializer):
+    card_type = serializers.ChoiceField(choices=Flashcard.CardType.choices)
+    # Required unless auto=true, in which case the AI itself decides the
+    # total -- validated in AiFlashcardGenerationService.generate, not here,
+    # since "required" is conditional on another field.
+    count = serializers.IntegerField(required=False, allow_null=True)
+    auto = serializers.BooleanField(required=False, default=False)
+    learning_request = serializers.CharField()
+
+
+class AiRegenerateRequestSerializer(serializers.Serializer):
+    selected_ids = serializers.ListField(child=serializers.IntegerField())
+    instruction = serializers.CharField()
+
+
+class AiRemoveCardsRequestSerializer(serializers.Serializer):
+    card_ids = serializers.ListField(child=serializers.IntegerField())
+
+
 class ReviewSubmissionSerializer(serializers.Serializer):
     rating = serializers.ChoiceField(choices=ReviewLog.Rating.choices, required=False)
     selected_option = serializers.IntegerField(required=False, min_value=0)
