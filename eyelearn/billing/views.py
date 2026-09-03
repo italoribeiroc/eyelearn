@@ -1,3 +1,5 @@
+import logging
+
 from django.views.decorators.csrf import csrf_exempt
 from rest_framework import status
 from rest_framework.decorators import api_view, authentication_classes, permission_classes, throttle_classes
@@ -5,13 +7,25 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 
-from .providers.base import InvalidWebhookSignature
+from .providers.base import InvalidWebhookSignature, RefundTargetNotFoundError
 from .serializers import CheckoutSessionRequestSerializer, PortalSessionRequestSerializer
-from .services import AlreadySubscribedError, BillingService, NoPaymentCustomerError
+from .services import (
+    AlreadySubscribedError,
+    BillingService,
+    NoActiveSubscriptionError,
+    NoPaymentCustomerError,
+    RefundWindowExpiredError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class CheckoutSessionRateThrottle(UserRateThrottle):
     scope = 'checkout_session'
+
+
+class CancelWithRefundRateThrottle(UserRateThrottle):
+    scope = 'cancel_with_refund'
 
 
 @api_view(['POST'])
@@ -64,6 +78,43 @@ def subscription_status(request):
         'status': result.status,
         'current_period_end': result.current_period_end,
         'cancel_at_period_end': result.cancel_at_period_end,
+        'refund_eligible_until': result.refund_eligible_until,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([CancelWithRefundRateThrottle])
+def cancel_with_refund(request):
+    try:
+        subscription = BillingService().cancel_with_refund(user=request.user)
+    except NoActiveSubscriptionError:
+        return Response({'detail': 'No active subscription found.'}, status=status.HTTP_404_NOT_FOUND)
+    except RefundWindowExpiredError:
+        return Response(
+            {'detail': 'The 7-day refund window has passed.'}, status=status.HTTP_400_BAD_REQUEST,
+        )
+    except RefundTargetNotFoundError:
+        return Response(
+            {'detail': 'No refundable payment was found for this subscription.'},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+    except Exception:
+        # Any other provider/Stripe failure -- matches the existing
+        # "upstream provider failure -> 502" convention used elsewhere
+        # (e.g. AI flashcard generation).
+        logger.exception('Failed to refund and cancel subscription for user %s', request.user.id)
+        return Response(
+            {'detail': 'Failed to process the refund. Please try again or contact support.'},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({
+        'plan': subscription.plan,
+        'status': subscription.status,
+        'current_period_end': subscription.current_period_end,
+        'cancel_at_period_end': subscription.cancel_at_period_end,
+        'refund_eligible_until': None,
     })
 
 

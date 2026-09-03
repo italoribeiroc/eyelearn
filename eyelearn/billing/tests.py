@@ -1,10 +1,14 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
+from django.utils import timezone as django_timezone
+from rest_framework_simplejwt.tokens import RefreshToken
 
-from billing.models import PaymentCustomer, ProcessedWebhookEvent, Subscription
+from eyelearn.test_utils import ApiTestCase
+
+from billing.models import PaymentCustomer, ProcessedWebhookEvent, Subscription, WITHDRAWAL_WINDOW_DAYS
 from billing.providers.base import (
     CheckoutSession,
     CustomerNotFound,
@@ -13,8 +17,15 @@ from billing.providers.base import (
     NormalizedEventType,
     PaymentProvider,
     PortalSession,
+    RefundTargetNotFoundError,
 )
-from billing.services import AlreadySubscribedError, BillingService, NoPaymentCustomerError
+from billing.services import (
+    AlreadySubscribedError,
+    BillingService,
+    NoActiveSubscriptionError,
+    NoPaymentCustomerError,
+    RefundWindowExpiredError,
+)
 
 User = get_user_model()
 
@@ -31,6 +42,10 @@ class FakePaymentProvider(PaymentProvider):
         self.events = {}
         self.missing_customer_refs = set()
         self.canceled_subscription_refs = []
+        self.refunded_subscription_refs = []
+        # Set to an Exception instance to make the next refund_subscription_payment
+        # call raise it, simulating a provider-side failure.
+        self.refund_failure = None
 
     @property
     def name(self):
@@ -67,9 +82,31 @@ class FakePaymentProvider(PaymentProvider):
     def cancel_subscription(self, *, subscription_ref):
         self.canceled_subscription_refs.append(subscription_ref)
 
+    def refund_subscription_payment(self, *, subscription_ref):
+        if self.refund_failure is not None:
+            failure, self.refund_failure = self.refund_failure, None
+            raise failure
+        self.refunded_subscription_refs.append(subscription_ref)
+
 
 def _make_user(username='alice', email='alice@example.com'):
     return User.objects.create_user(username=username, email=email, password='irrelevant123')
+
+
+def _auth_headers(user):
+    token = str(RefreshToken.for_user(user).access_token)
+    return {'HTTP_AUTHORIZATION': f'Bearer {token}'}
+
+
+def _backdate_subscription(subscription, *, days):
+    """auto_now_add blocks a normal .save() from changing created_at --
+    this bypasses it the same way a real "subscribed a while ago" row
+    would look, for testing withdrawal-window boundaries."""
+    Subscription.objects.filter(pk=subscription.pk).update(
+        created_at=django_timezone.now() - timedelta(days=days),
+    )
+    subscription.refresh_from_db()
+    return subscription
 
 
 class CancelActiveSubscriptionTests(TestCase):
@@ -78,15 +115,18 @@ class CancelActiveSubscriptionTests(TestCase):
         self.service = BillingService(provider=self.provider)
         self.user = _make_user()
 
-    def test_cancels_active_subscription(self):
+    def _make_subscription(self):
         customer = PaymentCustomer.objects.create(
             user=self.user, provider='fake', provider_customer_id='cus_fake_1',
         )
-        Subscription.objects.create(
+        return Subscription.objects.create(
             customer=customer, provider='fake', provider_subscription_id='sub_1',
             provider_price_id='price_1', plan='monthly', currency='usd',
             status=Subscription.Status.ACTIVE,
         )
+
+    def test_cancels_active_subscription(self):
+        self._make_subscription()
 
         self.service.cancel_active_subscription(user=self.user)
 
@@ -94,6 +134,86 @@ class CancelActiveSubscriptionTests(TestCase):
 
     def test_no_op_without_active_subscription(self):
         self.service.cancel_active_subscription(user=self.user)
+
+        self.assertEqual(self.provider.canceled_subscription_refs, [])
+
+    def test_attempts_refund_within_window_before_canceling(self):
+        self._make_subscription()  # created_at defaults to now -- within the window
+
+        self.service.cancel_active_subscription(user=self.user)
+
+        self.assertEqual(self.provider.refunded_subscription_refs, ['sub_1'])
+        self.assertEqual(self.provider.canceled_subscription_refs, ['sub_1'])
+
+    def test_swallows_refund_failure_and_still_cancels(self):
+        self._make_subscription()
+        self.provider.refund_failure = RuntimeError('Stripe is down')
+
+        self.service.cancel_active_subscription(user=self.user)  # must not raise
+
+        self.assertEqual(self.provider.refunded_subscription_refs, [])
+        self.assertEqual(self.provider.canceled_subscription_refs, ['sub_1'])
+
+    def test_skips_refund_outside_window(self):
+        subscription = self._make_subscription()
+        _backdate_subscription(subscription, days=WITHDRAWAL_WINDOW_DAYS + 1)
+
+        self.service.cancel_active_subscription(user=self.user)
+
+        self.assertEqual(self.provider.refunded_subscription_refs, [])
+        self.assertEqual(self.provider.canceled_subscription_refs, ['sub_1'])
+
+
+class CancelWithRefundTests(TestCase):
+    def setUp(self):
+        self.provider = FakePaymentProvider()
+        self.service = BillingService(provider=self.provider)
+        self.user = _make_user()
+
+    def _make_subscription(self):
+        customer = PaymentCustomer.objects.create(
+            user=self.user, provider='fake', provider_customer_id='cus_fake_1',
+        )
+        return Subscription.objects.create(
+            customer=customer, provider='fake', provider_subscription_id='sub_1',
+            provider_price_id='price_1', plan='monthly', currency='usd',
+            status=Subscription.Status.ACTIVE,
+        )
+
+    def test_refunds_and_cancels_within_window(self):
+        self._make_subscription()
+
+        result = self.service.cancel_with_refund(user=self.user)
+
+        self.assertEqual(self.provider.refunded_subscription_refs, ['sub_1'])
+        self.assertEqual(self.provider.canceled_subscription_refs, ['sub_1'])
+        self.assertEqual(result.status, Subscription.Status.CANCELED)
+        result.refresh_from_db()
+        self.assertEqual(result.status, Subscription.Status.CANCELED)
+
+    def test_raises_when_no_active_subscription(self):
+        with self.assertRaises(NoActiveSubscriptionError):
+            self.service.cancel_with_refund(user=self.user)
+
+        self.assertEqual(self.provider.refunded_subscription_refs, [])
+        self.assertEqual(self.provider.canceled_subscription_refs, [])
+
+    def test_raises_when_window_expired(self):
+        subscription = self._make_subscription()
+        _backdate_subscription(subscription, days=WITHDRAWAL_WINDOW_DAYS + 1)
+
+        with self.assertRaises(RefundWindowExpiredError):
+            self.service.cancel_with_refund(user=self.user)
+
+        self.assertEqual(self.provider.refunded_subscription_refs, [])
+        self.assertEqual(self.provider.canceled_subscription_refs, [])
+
+    def test_propagates_provider_error_and_does_not_cancel(self):
+        self._make_subscription()
+        self.provider.refund_failure = RuntimeError('Stripe is down')
+
+        with self.assertRaises(RuntimeError):
+            self.service.cancel_with_refund(user=self.user)
 
         self.assertEqual(self.provider.canceled_subscription_refs, [])
 
@@ -221,6 +341,7 @@ class GetStatusTests(TestCase):
         result = self.service.get_status(user=self.user)
         self.assertEqual(result.plan, 'free')
         self.assertIsNone(result.status)
+        self.assertIsNone(result.refund_eligible_until)
 
     def test_returns_active_subscription_fields(self):
         customer = PaymentCustomer.objects.create(
@@ -237,6 +358,38 @@ class GetStatusTests(TestCase):
         self.assertEqual(result.plan, 'annual')
         self.assertEqual(result.status, 'active')
         self.assertEqual(result.current_period_end, period_end)
+
+    def test_refund_eligible_until_set_for_recent_subscription(self):
+        customer = PaymentCustomer.objects.create(
+            user=self.user, provider='fake', provider_customer_id='cus_fake_1',
+        )
+        subscription = Subscription.objects.create(
+            customer=customer, provider='fake', provider_subscription_id='sub_1',
+            provider_price_id='price_1', plan='monthly', currency='usd',
+            status=Subscription.Status.ACTIVE,
+        )
+
+        result = self.service.get_status(user=self.user)
+
+        self.assertEqual(
+            result.refund_eligible_until,
+            subscription.created_at + timedelta(days=WITHDRAWAL_WINDOW_DAYS),
+        )
+
+    def test_refund_eligible_until_null_for_old_subscription(self):
+        customer = PaymentCustomer.objects.create(
+            user=self.user, provider='fake', provider_customer_id='cus_fake_1',
+        )
+        subscription = Subscription.objects.create(
+            customer=customer, provider='fake', provider_subscription_id='sub_1',
+            provider_price_id='price_1', plan='monthly', currency='usd',
+            status=Subscription.Status.ACTIVE,
+        )
+        _backdate_subscription(subscription, days=WITHDRAWAL_WINDOW_DAYS + 1)
+
+        result = self.service.get_status(user=self.user)
+
+        self.assertIsNone(result.refund_eligible_until)
 
 
 class HandleWebhookTests(TestCase):
@@ -374,6 +527,63 @@ class StripeProviderTests(TestCase):
 
         self._provider().cancel_subscription(subscription_ref='sub_123')  # must not raise
 
+    @patch('billing.providers.stripe_provider.stripe.Refund.create')
+    @patch('billing.providers.stripe_provider.stripe.Subscription.retrieve')
+    def test_refund_subscription_payment_uses_charge_when_payment_type_is_charge(
+        self, mock_retrieve, mock_refund,
+    ):
+        mock_retrieve.return_value = {
+            'latest_invoice': {
+                'payments': {'data': [{'payment': {'type': 'charge', 'charge': 'ch_123'}}]},
+            },
+        }
+
+        self._provider().refund_subscription_payment(subscription_ref='sub_123')
+
+        mock_retrieve.assert_called_once_with('sub_123', expand=['latest_invoice.payments'])
+        mock_refund.assert_called_once_with(charge='ch_123', reason='requested_by_customer')
+
+    @patch('billing.providers.stripe_provider.stripe.Refund.create')
+    @patch('billing.providers.stripe_provider.stripe.Subscription.retrieve')
+    def test_refund_subscription_payment_uses_payment_intent_when_payment_type_is_payment_intent(
+        self, mock_retrieve, mock_refund,
+    ):
+        mock_retrieve.return_value = {
+            'latest_invoice': {
+                'payments': {'data': [{'payment': {'type': 'payment_intent', 'payment_intent': 'pi_123'}}]},
+            },
+        }
+
+        self._provider().refund_subscription_payment(subscription_ref='sub_123')
+
+        mock_refund.assert_called_once_with(payment_intent='pi_123', reason='requested_by_customer')
+
+    @patch('billing.providers.stripe_provider.stripe.Refund.create')
+    @patch('billing.providers.stripe_provider.stripe.Subscription.retrieve')
+    def test_refund_subscription_payment_raises_when_no_payments_found(self, mock_retrieve, mock_refund):
+        mock_retrieve.return_value = {'latest_invoice': {'payments': {'data': []}}}
+
+        with self.assertRaises(RefundTargetNotFoundError):
+            self._provider().refund_subscription_payment(subscription_ref='sub_123')
+
+        mock_refund.assert_not_called()
+
+    @patch('billing.providers.stripe_provider.stripe.Refund.create')
+    @patch('billing.providers.stripe_provider.stripe.Subscription.retrieve')
+    def test_refund_subscription_payment_propagates_stripe_errors(self, mock_retrieve, mock_refund):
+        # Contrast with cancel_subscription's swallow test above -- a refund
+        # failure must NOT be swallowed here, callers need to know it failed.
+        import stripe as stripe_sdk
+        mock_retrieve.return_value = {
+            'latest_invoice': {
+                'payments': {'data': [{'payment': {'type': 'charge', 'charge': 'ch_123'}}]},
+            },
+        }
+        mock_refund.side_effect = stripe_sdk.error.StripeError('Stripe is down')
+
+        with self.assertRaises(stripe_sdk.error.StripeError):
+            self._provider().refund_subscription_payment(subscription_ref='sub_123')
+
     @patch('billing.providers.stripe_provider.stripe.checkout.Session.create')
     def test_create_checkout_session_raises_customer_not_found_when_stripe_rejects_customer(self, mock_create):
         import stripe as stripe_sdk
@@ -486,3 +696,76 @@ class StripeProviderTests(TestCase):
         event = self._provider().parse_webhook_event(payload=b'{}', headers={'Stripe-Signature': 'sig'})
 
         self.assertTrue(event.cancel_at_period_end)
+
+
+class CancelWithRefundViewTests(ApiTestCase):
+    """View-level status-code mapping for POST /api/billing/cancel-with-refund/.
+
+    Patches at the service boundary (matching the pattern used for
+    account-deletion's endpoint test in accounts/tests.py) rather than
+    mocking Stripe directly -- the Stripe-SDK-level behavior itself is
+    already covered by StripeProviderTests above."""
+
+    def setUp(self):
+        self.user = _make_user()
+        self.headers = _auth_headers(self.user)
+
+    def _post(self):
+        return self.client.post('/api/billing/cancel-with-refund/', **self.headers)
+
+    def test_requires_authentication(self):
+        response = self.client.post('/api/billing/cancel-with-refund/')
+
+        self.assertEqual(response.status_code, 401)
+
+    @patch('billing.services.BillingService.cancel_with_refund')
+    def test_returns_404_without_active_subscription(self, mock_cancel):
+        mock_cancel.side_effect = NoActiveSubscriptionError('no subscription')
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 404)
+
+    @patch('billing.services.BillingService.cancel_with_refund')
+    def test_returns_400_when_window_expired(self, mock_cancel):
+        mock_cancel.side_effect = RefundWindowExpiredError('window passed')
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 400)
+
+    @patch('billing.services.BillingService.cancel_with_refund')
+    def test_returns_502_on_refund_target_not_found(self, mock_cancel):
+        mock_cancel.side_effect = RefundTargetNotFoundError('nothing to refund')
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 502)
+
+    @patch('billing.services.BillingService.cancel_with_refund')
+    def test_returns_502_on_unexpected_provider_error(self, mock_cancel):
+        mock_cancel.side_effect = RuntimeError('Stripe is down')
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 502)
+
+    @patch('billing.services.BillingService.cancel_with_refund')
+    def test_returns_200_with_updated_subscription_on_success(self, mock_cancel):
+        customer = PaymentCustomer.objects.create(
+            user=self.user, provider='stripe', provider_customer_id='cus_1',
+        )
+        subscription = Subscription.objects.create(
+            customer=customer, provider='stripe', provider_subscription_id='sub_1',
+            provider_price_id='price_1', plan='monthly', currency='usd',
+            status=Subscription.Status.CANCELED,
+        )
+        mock_cancel.return_value = subscription
+
+        response = self._post()
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['plan'], 'monthly')
+        self.assertEqual(body['status'], 'canceled')
+        self.assertIsNone(body['refund_eligible_until'])

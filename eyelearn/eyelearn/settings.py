@@ -230,6 +230,7 @@ REST_FRAMEWORK = {
         'login': '10/hour',
         'token_refresh': '30/hour',
         'checkout_session': '10/hour',
+        'cancel_with_refund': '5/hour',
         'password_reset_request': '5/hour',
         'password_reset_confirm': '10/hour',
         'email_verification_confirm': '10/hour',

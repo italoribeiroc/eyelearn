@@ -1,5 +1,8 @@
+from datetime import timedelta
+
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class PaymentCustomer(models.Model):
@@ -68,6 +71,24 @@ def get_active_subscription(user):
         .order_by('-created_at')
         .first()
     )
+
+
+# Universal 7-day right-of-withdrawal refund window, applied to every
+# customer regardless of jurisdiction (CDC Art. 49-inspired -- Brazil's
+# consumer protection law grants this specifically, but being more
+# generous everywhere is simpler than branching on currency/locale and is
+# never a compliance problem).
+WITHDRAWAL_WINDOW_DAYS = 7
+
+
+def is_within_withdrawal_window(subscription) -> bool:
+    """Whether `subscription` is still within the 7-day refund window,
+    measured from when the local Subscription row was first created (set
+    by _apply_checkout_completed's update_or_create, moments after the
+    checkout.session.completed webhook fires) -- effectively the same
+    moment as Stripe's own subscription.created, without a second Stripe
+    round-trip just to check eligibility."""
+    return timezone.now() - subscription.created_at <= timedelta(days=WITHDRAWAL_WINDOW_DAYS)
 
 
 class ProcessedWebhookEvent(models.Model):

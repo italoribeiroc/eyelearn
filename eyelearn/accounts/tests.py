@@ -18,6 +18,7 @@ class RegisterEndpointTests(ApiTestCase):
             'email': 'bob@example.com',
             'password': 'a-strong-password-123',
             'first_name': 'Bob',
+            'terms_accepted': True,
         })
 
         self.assertEqual(response.status_code, 201)
@@ -35,6 +36,7 @@ class RegisterEndpointTests(ApiTestCase):
             'email': 'bob@example.com',
             'password': 'a-strong-password-123',
             'first_name': 'Bob',
+            'terms_accepted': True,
         })
 
         response = self.client.post('/api/auth/login/', {
@@ -48,6 +50,7 @@ class RegisterEndpointTests(ApiTestCase):
             'username': 'bob',
             'email': 'bob@example.com',
             'password': 'a-strong-password-123',
+            'terms_accepted': True,
         })
 
         self.assertEqual(response.status_code, 400)
@@ -63,6 +66,7 @@ class RegisterEndpointTests(ApiTestCase):
             'email': 'second@example.com',
             'password': 'a-strong-password-123',
             'first_name': 'Bob',
+            'terms_accepted': True,
         })
 
         self.assertEqual(response.status_code, 400)
@@ -78,6 +82,7 @@ class RegisterEndpointTests(ApiTestCase):
             'email': 'bob@example.com',
             'password': 'a-strong-password-123',
             'first_name': 'Bob',
+            'terms_accepted': True,
         })
 
         self.assertEqual(response.status_code, 400)
@@ -89,11 +94,53 @@ class RegisterEndpointTests(ApiTestCase):
             'email': 'bob@example.com',
             'password': 'password',
             'first_name': 'Bob',
+            'terms_accepted': True,
         })
 
         self.assertEqual(response.status_code, 400)
         self.assertIn('password', response.json())
         self.assertFalse(get_user_model().objects.filter(username='bob').exists())
+
+    def test_register_rejects_missing_terms_accepted(self, mock_send):
+        response = self.client.post('/api/auth/register/', {
+            'username': 'bob',
+            'email': 'bob@example.com',
+            'password': 'a-strong-password-123',
+            'first_name': 'Bob',
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('terms_accepted', response.json())
+        self.assertFalse(get_user_model().objects.filter(username='bob').exists())
+
+    def test_register_rejects_false_terms_accepted(self, mock_send):
+        response = self.client.post('/api/auth/register/', {
+            'username': 'bob',
+            'email': 'bob@example.com',
+            'password': 'a-strong-password-123',
+            'first_name': 'Bob',
+            'terms_accepted': False,
+        })
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('terms_accepted', response.json())
+        self.assertFalse(get_user_model().objects.filter(username='bob').exists())
+
+    def test_register_sets_terms_accepted_at(self, mock_send):
+        before = timezone.now()
+
+        response = self.client.post('/api/auth/register/', {
+            'username': 'bob',
+            'email': 'bob@example.com',
+            'password': 'a-strong-password-123',
+            'first_name': 'Bob',
+            'terms_accepted': True,
+        })
+
+        self.assertEqual(response.status_code, 201)
+        user = get_user_model().objects.get(username='bob')
+        self.assertIsNotNone(user.terms_accepted_at)
+        self.assertGreaterEqual(user.terms_accepted_at, before)
 
 
 class AuthEndpointTests(ApiTestCase):
@@ -511,6 +558,7 @@ class EmailVerificationTests(ApiTestCase):
         payload = {
             'username': 'bob', 'email': 'bob@example.com',
             'password': 'a-strong-password-123', 'first_name': 'Bob',
+            'terms_accepted': True,
         }
         payload.update(overrides)
         response = self.client.post('/api/auth/register/', payload)
@@ -604,6 +652,7 @@ class EmailVerificationTests(ApiTestCase):
         response = self.client.post('/api/auth/register/', {
             'username': 'bob', 'email': 'bob@example.com',
             'password': 'a-strong-password-123', 'first_name': 'Bob',
+            'terms_accepted': True,
         })
 
         self.assertEqual(response.status_code, 400)
