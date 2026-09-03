@@ -14,6 +14,7 @@ from .base import (
     NormalizedEventType,
     PaymentProvider,
     PortalSession,
+    RefundTargetNotFoundError,
 )
 
 logger = logging.getLogger(__name__)
@@ -119,6 +120,48 @@ class StripeProvider(PaymentProvider):
             # Best-effort: e.g. already canceled/deleted on Stripe's side.
             # Shouldn't block the account deletion that triggered this.
             logger.exception('Failed to cancel Stripe subscription %s', subscription_ref)
+
+    def refund_subscription_payment(self, *, subscription_ref: str) -> None:
+        # stripe.Invoice has no top-level charge/payment_intent on this SDK
+        # version (a common outdated assumption) -- the real path to the
+        # payment behind a subscription is
+        # Subscription.latest_invoice.payments.data[0].payment, which
+        # carries exactly one of .charge/.payment_intent depending on
+        # .type. Verified against the installed stripe==15.5.1 source, not
+        # guessed.
+        subscription = stripe.Subscription.retrieve(
+            subscription_ref, expand=['latest_invoice.payments'],
+        )
+        invoice = subscription['latest_invoice']
+        # StripeObject supports [...] indexing but NOT dict's .get() method
+        # (a real AttributeError, confirmed live against the actual API,
+        # not just the mocked tests) -- stick to plain indexing throughout.
+        payments = []
+        if invoice is not None:
+            payments_container = invoice['payments']
+            if payments_container is not None:
+                payments = payments_container['data']
+        if not payments:
+            raise RefundTargetNotFoundError(
+                f'No refundable payment found for subscription {subscription_ref!r}.',
+            )
+
+        payment = payments[0]['payment']
+        refund_kwargs = {'reason': 'requested_by_customer'}
+        if payment['type'] == 'charge':
+            refund_kwargs['charge'] = payment['charge']
+        elif payment['type'] == 'payment_intent':
+            refund_kwargs['payment_intent'] = payment['payment_intent']
+        else:
+            raise RefundTargetNotFoundError(
+                f'Payment type {payment["type"]!r} on subscription {subscription_ref!r} '
+                f'is not refundable via this flow.',
+            )
+
+        # Deliberately not caught here -- unlike cancel_subscription, a
+        # failure must propagate so the caller (BillingService) knows the
+        # refund did not happen before deciding whether to cancel.
+        stripe.Refund.create(**refund_kwargs)
 
     def parse_webhook_event(self, *, payload: bytes, headers: Mapping[str, str]) -> NormalizedEvent:
         signature = headers.get('Stripe-Signature') or headers.get('stripe-signature')

@@ -19,6 +19,15 @@ class CustomerNotFound(Exception):
     """
 
 
+class RefundTargetNotFoundError(Exception):
+    """Raised when a subscription has no payment (charge/PaymentIntent) to refund.
+
+    Surfaces when the subscription's latest invoice, or that invoice's
+    payments list, is empty/None -- e.g. a $0-today subscription created
+    via a 100%-off promo code, which never produced a real charge.
+    """
+
+
 @dataclass(frozen=True)
 class CheckoutSession:
     url: str
@@ -112,4 +121,20 @@ class PaymentProvider(ABC):
         implementations should tolerate the subscription already being gone
         or canceled on the provider's side rather than raising, since that
         shouldn't block the account deletion that triggered this call.
+        """
+
+    @abstractmethod
+    def refund_subscription_payment(self, *, subscription_ref: str) -> None:
+        """Refunds the most recent payment behind an active subscription, in full.
+
+        Used by the self-serve 7-day right-of-withdrawal cancel-and-refund
+        flow -- unlike cancel_subscription, this does NOT swallow errors:
+        callers need to know definitively whether the refund succeeded
+        before also canceling the subscription.
+
+        Raises RefundTargetNotFoundError if the subscription has no
+        refundable payment (e.g. a $0-today promo-code subscription).
+        Raises the provider's own error type for any other failure
+        (network, already refunded, etc.) -- callers should treat any of
+        these as "the refund did not happen."
         """
