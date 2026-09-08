@@ -42,3 +42,18 @@ def generate_download_url(*, key, expires_in=3600):
 
 def delete_object(*, key):
     _client().delete_object(Bucket=settings.STORAGE_BUCKET_NAME, Key=key)
+
+
+def build_document_storage_key(*, user_id, collection_id, filename):
+    # Nested under flashcards/ (not a top-level source-documents/ prefix) so
+    # this stays within the same bucket-key-prefix restriction the storage
+    # credentials already enforce for every other upload this app makes --
+    # confirmed live against the real bucket: a top-level source-documents/
+    # key was rejected with AccessDenied ("not entitled") while anything
+    # under flashcards/ succeeds.
+    ext = os.path.splitext(filename)[1].lower()
+    return f'flashcards/{user_id}/source-documents/{collection_id}/{uuid4().hex}{ext}'
+
+
+def download_object(*, key):
+    return _client().get_object(Bucket=settings.STORAGE_BUCKET_NAME, Key=key)['Body'].read()

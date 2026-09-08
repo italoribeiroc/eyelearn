@@ -197,6 +197,39 @@ class FlashcardGenerationDraft(models.Model):
         return f'{self.user_id}:{self.collection_id} ({self.status}, {len(self.cards)} cards)'
 
 
+class GenerationSourceDocument(models.Model):
+    """Extracted text from a user-uploaded document (PDF/TXT/MD/image), fed
+    into AI flashcard generation the same way learning_request is. The raw
+    file is never persisted -- storage.delete_object() runs right after
+    extraction (see SourceDocumentService.confirm_upload).
+
+    `draft` starts null: a document is uploaded from AiGenerateDialog before
+    any draft exists. AiFlashcardGenerationService.generate() links it to the
+    new draft, so generate_next_batch/regenerate can re-read the same
+    extracted_text later without re-uploading.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='generation_source_documents',
+    )
+    collection = models.ForeignKey(Collection, on_delete=models.CASCADE, related_name='generation_source_documents')
+    draft = models.ForeignKey(
+        FlashcardGenerationDraft, on_delete=models.CASCADE, null=True, blank=True, related_name='source_documents',
+    )
+    filename = models.CharField(max_length=255)
+    content_type = models.CharField(max_length=100)
+    size_bytes = models.PositiveBigIntegerField()
+    # Cleared (set to '') once the draft this document was used for reaches a
+    # terminal state -- see AiFlashcardGenerationService.confirm/discard.
+    extracted_text = models.TextField(blank=True, default='')
+    char_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.filename
+
+
 class ReviewLog(models.Model):
     class Rating(models.IntegerChoices):
         AGAIN = 1, 'Again'

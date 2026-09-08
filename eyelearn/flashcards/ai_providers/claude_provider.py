@@ -1,6 +1,8 @@
 """The only file in this app that imports `anthropic`, mirroring
 billing/providers/stripe_provider.py's "one file owns the SDK" rule."""
 
+import base64
+
 import anthropic
 from django.conf import settings
 from pydantic import ValidationError
@@ -67,3 +69,43 @@ class ClaudeProvider(AiProvider):
         if parsed is None:
             raise AiGenerationError('Claude did not return a structured response.')
         return parsed
+
+    def describe_image(self, *, image_bytes, media_type, prompt):
+        if not settings.CLAUDE_API_KEY:
+            raise ProviderUnavailableError('CLAUDE_API_KEY is not configured.')
+
+        try:
+            response = self._client().messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                messages=[{
+                    'role': 'user',
+                    'content': [
+                        {
+                            'type': 'image',
+                            'source': {
+                                'type': 'base64',
+                                'media_type': media_type,
+                                'data': base64.b64encode(image_bytes).decode('ascii'),
+                            },
+                        },
+                        {'type': 'text', 'text': prompt},
+                    ],
+                }],
+            )
+        except anthropic.RateLimitError as exc:
+            raise ProviderUnavailableError('Claude rate limit exceeded.') from exc
+        except anthropic.APIStatusError as exc:
+            message = _error_message(exc)
+            if exc.status_code in _UNAVAILABLE_STATUS_CODES or any(
+                marker in message.lower() for marker in _INSUFFICIENT_CREDIT_MARKERS
+            ):
+                raise ProviderUnavailableError(f'Claude unavailable ({exc.status_code}): {message}') from exc
+            raise AiGenerationError(f'Claude API error ({exc.status_code}): {message}') from exc
+        except anthropic.APIConnectionError as exc:
+            raise ProviderUnavailableError('Could not reach Claude.') from exc
+
+        text = ''.join(block.text for block in response.content if getattr(block, 'type', None) == 'text')
+        if not text.strip():
+            raise AiGenerationError('Claude did not return any text for this image.')
+        return text

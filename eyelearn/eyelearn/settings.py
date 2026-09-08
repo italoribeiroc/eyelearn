@@ -241,6 +241,7 @@ REST_FRAMEWORK = {
         # generation legitimately needs up to MAX_AI_GENERATE_COUNT /
         # AI_GENERATION_BATCH_SIZE continuation calls (20) on its own.
         'ai_flashcard_generation_batch': '200/hour',
+        'ai_source_document': '60/hour',
     },
     'DEFAULT_RENDERER_CLASSES': (
         ['rest_framework.renderers.JSONRenderer', 'rest_framework.renderers.BrowsableAPIRenderer']

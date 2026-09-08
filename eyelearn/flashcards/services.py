@@ -10,13 +10,14 @@ from django.db import transaction
 from django.db.models import Count, F, Sum
 from django.utils import timezone
 
-from . import ai_generation, storage
+from . import ai_generation, document_extraction, storage
 from .models import (
     Collection,
     CollectionGoal,
     Flashcard,
     FlashcardGenerationDraft,
     FlashcardMedia,
+    GenerationSourceDocument,
     ReviewLog,
     ReviewState,
     StudyDay,
@@ -38,6 +39,11 @@ MAX_EXISTING_CARDS_CONTEXT = 150
 # is filled by repeated, individually-bounded continuation calls instead of
 # one huge one.
 AI_GENERATION_BATCH_SIZE = 25
+
+MAX_SOURCE_DOCUMENTS_PER_REQUEST = 5
+MAX_PENDING_SOURCE_DOCUMENTS_PER_USER = 20
+MAX_EXTRACTED_CHARS_PER_DOCUMENT = 100_000   # truncated, not rejected, if exceeded
+MAX_TOTAL_SOURCE_DOCUMENT_CHARS = 200_000    # combined across all docs on one generate() call
 
 
 class CollectionCycleError(Exception):
@@ -66,6 +72,18 @@ class AiGenerationNotAllowedError(Exception):
 
 class AiGenerationValidationError(Exception):
     """Raised for out-of-range count/length, or an invalid selected_ids/card_ids list."""
+
+
+class UnsupportedDocumentError(Exception):
+    """Raised when a requested source-document content type/size isn't allowed."""
+
+
+class DocumentExtractionFailedError(Exception):
+    """Raised when text/visual extraction from an uploaded document fails."""
+
+
+class TooManySourceDocumentsError(Exception):
+    """Raised when a user has too many unlinked (not-yet-generated-from) source documents."""
 
 
 ALLOWED_CONTENT_TYPES = {
@@ -175,18 +193,22 @@ class AiFlashcardGenerationService:
         if get_active_subscription(user) is None:
             raise AiGenerationNotAllowedError('AI flashcard generation is a Pro feature.')
 
-    def generate(self, *, user, collection, card_type, learning_request, count=None, auto=False):
+    def generate(self, *, user, collection, card_type, learning_request, count=None, auto=False,
+                 source_document_ids=None):
         self.assert_pro(user=user)
         if not auto:
             if not count or not (1 <= count <= MAX_AI_GENERATE_COUNT):
                 raise AiGenerationValidationError(f'count must be between 1 and {MAX_AI_GENERATE_COUNT}.')
         learning_request = (learning_request or '').strip()
-        if not learning_request:
-            raise AiGenerationValidationError('learning_request is required.')
         if len(learning_request) > MAX_LEARNING_REQUEST_LENGTH:
             raise AiGenerationValidationError(
                 f'learning_request must be at most {MAX_LEARNING_REQUEST_LENGTH} characters.',
             )
+
+        documents = self._resolve_source_documents(user=user, collection=collection, ids=source_document_ids)
+        if not learning_request and not documents:
+            raise AiGenerationValidationError('learning_request or at least one source document is required.')
+        source_documents_payload = self._source_documents_payload(documents)
 
         # Clean up any abandoned draft before starting a new one, so drafts
         # don't pile up -- same "reclaim stale state" idea as
@@ -209,6 +231,7 @@ class AiFlashcardGenerationService:
                 collection_context=collection_context,
                 existing_card_prompts=existing_prompts,
                 learning_context=learning_context,
+                source_documents=source_documents_payload,
             )
             cards = result.cards
             # Never let the target be smaller than what was already
@@ -224,6 +247,7 @@ class AiFlashcardGenerationService:
                 collection_context=collection_context,
                 existing_card_prompts=existing_prompts,
                 learning_context=learning_context,
+                source_documents=source_documents_payload,
             )
             target_count = count
 
@@ -235,6 +259,8 @@ class AiFlashcardGenerationService:
             target_count=target_count,
             cards=[self._draft_dict(index + 1, card_type, card) for index, card in enumerate(cards)],
         )
+        if documents:
+            GenerationSourceDocument.objects.filter(id__in=[doc.id for doc in documents]).update(draft=draft)
         return draft
 
     def generate_next_batch(self, *, user, draft):
@@ -268,6 +294,7 @@ class AiFlashcardGenerationService:
             card['prompt'] for card in draft.cards
         ]
         learning_context = self._build_learning_context(user=user, collection=draft.collection)
+        source_documents_payload = self._source_documents_payload(draft.source_documents.all())
 
         cards = ai_generation.generate_cards(
             card_type=draft.card_type,
@@ -278,6 +305,7 @@ class AiFlashcardGenerationService:
             learning_context=learning_context,
             already_generated=len(draft.cards),
             target_count=draft.target_count,
+            source_documents=source_documents_payload,
         )
 
         with transaction.atomic():
@@ -317,6 +345,7 @@ class AiFlashcardGenerationService:
 
         cards_to_replace = [by_id[card_id] for card_id in selected_ids]
         existing_prompts = self._existing_card_prompts(draft.collection)
+        source_documents_payload = self._source_documents_payload(draft.source_documents.all())
 
         new_cards = ai_generation.regenerate_cards(
             card_type=draft.card_type,
@@ -325,6 +354,7 @@ class AiFlashcardGenerationService:
             cards_to_replace=cards_to_replace,
             existing_card_prompts=existing_prompts,
             instruction=instruction,
+            source_documents=source_documents_payload,
         )
 
         with transaction.atomic():
@@ -386,6 +416,7 @@ class AiFlashcardGenerationService:
 
         draft.status = FlashcardGenerationDraft.Status.CONFIRMED
         draft.save(update_fields=['status', 'updated_at'])
+        draft.source_documents.update(extracted_text='')
         return created, errors
 
     def discard(self, *, user, draft):
@@ -393,7 +424,32 @@ class AiFlashcardGenerationService:
             raise AiGenerationValidationError('This generation was already saved.')
         draft.status = FlashcardGenerationDraft.Status.DISCARDED
         draft.save(update_fields=['status', 'updated_at'])
+        draft.source_documents.update(extracted_text='')
         return draft
+
+    def _resolve_source_documents(self, *, user, collection, ids):
+        if not ids:
+            return []
+        if len(ids) > MAX_SOURCE_DOCUMENTS_PER_REQUEST:
+            raise AiGenerationValidationError(
+                f'At most {MAX_SOURCE_DOCUMENTS_PER_REQUEST} source documents are allowed per request.',
+            )
+        documents = list(
+            GenerationSourceDocument.objects.filter(
+                id__in=ids, user=user, collection=collection, draft__isnull=True,
+            ),
+        )
+        if len(documents) != len(set(ids)):
+            raise AiGenerationValidationError('One or more source documents were not found.')
+        total_chars = sum(doc.char_count for doc in documents)
+        if total_chars > MAX_TOTAL_SOURCE_DOCUMENT_CHARS:
+            raise AiGenerationValidationError(
+                f'Combined source document length must be at most {MAX_TOTAL_SOURCE_DOCUMENT_CHARS} characters.',
+            )
+        return documents
+
+    def _source_documents_payload(self, documents):
+        return [{'filename': doc.filename, 'text': doc.extracted_text} for doc in documents if doc.extracted_text]
 
     def _assert_pending(self, draft):
         if draft.status != FlashcardGenerationDraft.Status.PENDING:
@@ -485,6 +541,82 @@ class MediaService:
         max_size = MAX_SIZE_BYTES.get(media_type)
         if max_size and size_bytes > max_size:
             raise UnsupportedMediaError(f'File exceeds the {max_size} byte limit for media type {media_type!r}.')
+
+
+class SourceDocumentService:
+    """Upload-url/confirm flow for AI-generation source documents, mirroring
+    MediaService's shape. Unlike media, the raw uploaded file is never kept:
+    confirm_upload downloads it once, extracts text (see
+    document_extraction.py), then deletes the bucket object immediately --
+    only the extracted text persists (in GenerationSourceDocument.extracted_text),
+    for the lifetime of whatever draft ends up using it.
+    """
+
+    def create_upload_url(self, *, user, collection, content_type, filename, size_bytes):
+        AiFlashcardGenerationService().assert_pro(user=user)
+        self._validate(content_type=content_type, size_bytes=size_bytes)
+        key = storage.build_document_storage_key(user_id=user.id, collection_id=collection.id, filename=filename)
+        upload_url = storage.generate_upload_url(key=key, content_type=content_type)
+        return key, upload_url
+
+    def confirm_upload(self, *, user, collection, storage_key, content_type, filename, size_bytes):
+        AiFlashcardGenerationService().assert_pro(user=user)
+        self._validate(content_type=content_type, size_bytes=size_bytes)
+
+        pending_count = GenerationSourceDocument.objects.filter(user=user, draft__isnull=True).count()
+        if pending_count >= MAX_PENDING_SOURCE_DOCUMENTS_PER_USER:
+            raise TooManySourceDocumentsError(
+                f'You can have at most {MAX_PENDING_SOURCE_DOCUMENTS_PER_USER} documents pending generation.',
+            )
+
+        try:
+            data = storage.download_object(key=storage_key)
+            try:
+                extracted_text = document_extraction.extract_text(content_type=content_type, data=data)
+            except document_extraction.DocumentExtractionError as exc:
+                raise DocumentExtractionFailedError(str(exc))
+        finally:
+            # The raw file is genuinely temporary -- delete it whether
+            # extraction succeeded or failed, never leaving it in the bucket.
+            storage.delete_object(key=storage_key)
+
+        if len(extracted_text) > MAX_EXTRACTED_CHARS_PER_DOCUMENT:
+            extracted_text = extracted_text[:MAX_EXTRACTED_CHARS_PER_DOCUMENT]
+
+        return GenerationSourceDocument.objects.create(
+            user=user,
+            collection=collection,
+            filename=filename,
+            content_type=content_type,
+            size_bytes=size_bytes,
+            extracted_text=extracted_text,
+            char_count=len(extracted_text),
+        )
+
+    def delete_document(self, *, document):
+        document.delete()
+
+    def update_text(self, *, document, extracted_text):
+        """Lets the user correct extraction/transcription mistakes (most
+        relevant for a photo or scanned page run through the vision
+        fallback, but allowed for any document type) before it's ever fed
+        into a generation prompt. Only reachable on an unlinked document
+        (draft__isnull=True, enforced by the view's lookup) -- once a
+        document has been used by a draft, its text is either already baked
+        into that draft's cards or has been cleared (see
+        AiFlashcardGenerationService.confirm/discard)."""
+        extracted_text = extracted_text[:MAX_EXTRACTED_CHARS_PER_DOCUMENT]
+        document.extracted_text = extracted_text
+        document.char_count = len(extracted_text)
+        document.save(update_fields=['extracted_text', 'char_count', 'updated_at'])
+        return document
+
+    def _validate(self, *, content_type, size_bytes):
+        if content_type not in document_extraction.ALLOWED_CONTENT_TYPES:
+            raise UnsupportedDocumentError(f'{content_type!r} is not a supported document type.')
+        max_size = document_extraction.MAX_SIZE_BYTES.get(content_type)
+        if max_size and size_bytes > max_size:
+            raise UnsupportedDocumentError(f'File exceeds the {max_size} byte limit for {content_type!r}.')
 
 
 _FSRS_STATE_TO_OURS = {

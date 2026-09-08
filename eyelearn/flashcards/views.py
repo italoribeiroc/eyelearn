@@ -12,7 +12,14 @@ from rest_framework.throttling import UserRateThrottle
 
 from .ai_generation import AiGenerationError
 from .ai_providers import pop_last_provider_used
-from .models import Collection, CollectionGoal, Flashcard, FlashcardGenerationDraft, FlashcardMedia
+from .models import (
+    Collection,
+    CollectionGoal,
+    Flashcard,
+    FlashcardGenerationDraft,
+    FlashcardMedia,
+    GenerationSourceDocument,
+)
 from .serializers import (
     AiGenerationRequestSerializer,
     AiRegenerateRequestSerializer,
@@ -21,9 +28,14 @@ from .serializers import (
     CollectionSerializer,
     FlashcardMediaSerializer,
     FlashcardSerializer,
+    GenerationSourceDocumentDetailSerializer,
+    GenerationSourceDocumentSerializer,
     MediaConfirmSerializer,
     MediaUploadURLRequestSerializer,
     ReviewSubmissionSerializer,
+    SourceDocumentConfirmSerializer,
+    SourceDocumentUpdateTextSerializer,
+    SourceDocumentUploadURLRequestSerializer,
 )
 from .services import (
     AiFlashcardGenerationService,
@@ -33,12 +45,16 @@ from .services import (
     CollectionLimitError,
     CollectionService,
     CrossOwnerParentError,
+    DocumentExtractionFailedError,
     FlashcardLimitError,
     FlashcardService,
     GoalService,
     MediaService,
     ReviewService,
+    SourceDocumentService,
     StreakService,
+    TooManySourceDocumentsError,
+    UnsupportedDocumentError,
     UnsupportedMediaError,
 )
 
@@ -55,6 +71,10 @@ class AiGenerationBatchRateThrottle(UserRateThrottle):
     MAX_AI_GENERATE_COUNT / AI_GENERATION_BATCH_SIZE calls (20), which would
     exhaust the regular ai_flashcard_generation budget in one go."""
     scope = 'ai_flashcard_generation_batch'
+
+
+class SourceDocumentThrottle(UserRateThrottle):
+    scope = 'ai_source_document'
 
 
 def _user_collection_or_404(user, collection_id):
@@ -91,6 +111,7 @@ def _serialize_draft(draft):
         'status': draft.status,
         'target_count': draft.target_count,
         'cards': draft.cards,
+        'source_documents': GenerationSourceDocumentSerializer(draft.source_documents.all(), many=True).data,
     }
 
 
@@ -178,6 +199,75 @@ def flashcard_list(request, collection_id):
     return Response(FlashcardSerializer(flashcard).data, status=status.HTTP_201_CREATED)
 
 
+# Matches the frontend's own MAX_IMPORT_BATCH_SIZE (src/lib/flashcards/import.ts)
+# -- that's the only caller today (see its docstring for why importing in
+# batches exists at all), but this cap is enforced independently here too.
+MAX_BULK_CREATE_SIZE = 100
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def flashcard_bulk_create(request, collection_id):
+    """Creates up to MAX_BULK_CREATE_SIZE flashcards in one request.
+
+    Exists specifically for importing a large deck (see eyelearn-ui's
+    import route): looping flashcard_list's single-create endpoint once per
+    card means hundreds or thousands of requests for one big import, which
+    blows through DEFAULT_THROTTLE_RATES's 'user' scope (120/min, the
+    fallback flashcard_list itself sits under -- no throttle_classes of its
+    own) long before the deck finishes. Batching many cards into few
+    requests keeps a large import's total request count sane regardless of
+    deck size, the same way generate-next-batch exists so a large AI
+    generation doesn't need one request per card either.
+
+    Still validates and creates one card at a time (not a raw bulk_create)
+    so each card gets the same FlashcardSerializer validation and
+    assert_can_create gating as the single-create endpoint, and a bad card
+    doesn't prevent the valid ones around it from saving.
+    """
+    collection = _user_collection_or_404(request.user, collection_id)
+
+    cards_data = request.data.get('cards')
+    if not isinstance(cards_data, list) or not cards_data:
+        return Response({'detail': 'cards must be a non-empty list.'}, status=status.HTTP_400_BAD_REQUEST)
+    if len(cards_data) > MAX_BULK_CREATE_SIZE:
+        return Response(
+            {'detail': f'A bulk request can contain at most {MAX_BULK_CREATE_SIZE} cards.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    created = []
+    errors = []
+    limit_reached = False
+
+    for index, card_data in enumerate(cards_data):
+        if limit_reached:
+            # Every remaining card would hit the same cap -- report them as
+            # skipped without bothering to validate/attempt each one.
+            errors.append({'index': index, 'errors': {'detail': 'Flashcard limit reached.'}})
+            continue
+
+        serializer = FlashcardSerializer(data=card_data)
+        if not serializer.is_valid():
+            errors.append({'index': index, 'errors': serializer.errors})
+            continue
+
+        try:
+            FlashcardService().assert_can_create(user=request.user)
+        except FlashcardLimitError:
+            limit_reached = True
+            errors.append({'index': index, 'errors': {'detail': 'Flashcard limit reached.'}})
+            continue
+
+        created.append(serializer.save(collection=collection))
+
+    return Response({
+        'created': FlashcardSerializer(created, many=True).data,
+        'errors': errors,
+        'limit_reached': limit_reached,
+    })
+
+
 @api_view(['GET', 'PATCH', 'DELETE'])
 @permission_classes([IsAuthenticated])
 def flashcard_detail(request, flashcard_id):
@@ -236,6 +326,68 @@ def media_delete(request, media_id):
     media = get_object_or_404(FlashcardMedia, pk=media_id, flashcard__collection__user=request.user)
     MediaService().delete_media(media=media)
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([SourceDocumentThrottle])
+def source_document_upload_url(request, collection_id):
+    collection = _user_collection_or_404(request.user, collection_id)
+
+    serializer = SourceDocumentUploadURLRequestSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        storage_key, upload_url = SourceDocumentService().create_upload_url(
+            user=request.user, collection=collection, **serializer.validated_data,
+        )
+    except AiGenerationNotAllowedError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+    except UnsupportedDocumentError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({'storage_key': storage_key, 'upload_url': upload_url})
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([SourceDocumentThrottle])
+def source_document_confirm(request, collection_id):
+    collection = _user_collection_or_404(request.user, collection_id)
+
+    serializer = SourceDocumentConfirmSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+
+    try:
+        document = SourceDocumentService().confirm_upload(
+            user=request.user, collection=collection, **serializer.validated_data,
+        )
+    except AiGenerationNotAllowedError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_402_PAYMENT_REQUIRED)
+    except (UnsupportedDocumentError, DocumentExtractionFailedError, TooManySourceDocumentsError) as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response(GenerationSourceDocumentDetailSerializer(document).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def source_document_detail(request, document_id):
+    # Only reachable while unlinked (not yet used by a generation) -- same
+    # scope as delete: once a draft has consumed a document's text, editing
+    # it here would have no effect on cards already generated from it.
+    document = get_object_or_404(
+        GenerationSourceDocument, pk=document_id, user=request.user, draft__isnull=True,
+    )
+
+    if request.method == 'DELETE':
+        SourceDocumentService().delete_document(document=document)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    serializer = SourceDocumentUpdateTextSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    document = SourceDocumentService().update_text(document=document, **serializer.validated_data)
+    return Response(GenerationSourceDocumentDetailSerializer(document).data)
 
 
 def _serialize_queue_items(review_states):

@@ -58,3 +58,28 @@ class GeminiProvider(AiProvider):
             return response_model.model_validate_json(response.text)
         except ValidationError as exc:
             raise AiGenerationError(f'Gemini response failed schema validation: {exc}') from exc
+
+    def describe_image(self, *, image_bytes, media_type, prompt):
+        if not settings.GEMINI_API_KEY:
+            raise ProviderUnavailableError('GEMINI_API_KEY is not configured.')
+
+        client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        try:
+            response = client.models.generate_content(
+                model=MODEL,
+                contents=[
+                    genai_types.Part.from_bytes(data=image_bytes, mime_type=media_type),
+                    prompt,
+                ],
+            )
+        except genai_errors.APIError as exc:
+            if exc.code in _UNAVAILABLE_CODES:
+                raise ProviderUnavailableError(f'Gemini unavailable ({exc.code}).') from exc
+            raise AiGenerationError(f'Gemini API error ({exc.code}).') from exc
+        except Exception as exc:
+            raise ProviderUnavailableError(f'Could not reach Gemini: {exc}') from exc
+
+        text = (getattr(response, 'text', None) or '').strip()
+        if not text:
+            raise AiGenerationError('Gemini did not return any text for this image.')
+        return text

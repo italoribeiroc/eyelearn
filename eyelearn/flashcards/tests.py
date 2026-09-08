@@ -1,3 +1,4 @@
+import io
 import json
 from datetime import timedelta
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from unittest.mock import patch
 import anthropic
 import groq
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
 from django.test import TestCase
 
 from eyelearn.test_utils import ApiTestCase
@@ -13,15 +15,16 @@ from django.utils import timezone
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from billing.models import PaymentCustomer, Subscription
-from flashcards import ai_generation
+from flashcards import ai_generation, document_extraction
 from flashcards.ai_providers import generate_with_fallback
-from flashcards.ai_providers.base import BasicCardAutoBatch, BasicCardBatch, ProviderUnavailableError
+from flashcards.ai_providers.base import AiGenerationError, BasicCardAutoBatch, BasicCardBatch, ProviderUnavailableError
 from flashcards.models import (
     Collection,
     CollectionGoal,
     Flashcard,
     FlashcardGenerationDraft,
     FlashcardMedia,
+    GenerationSourceDocument,
     ReviewLog,
     ReviewState,
     StudyDay,
@@ -32,15 +35,23 @@ from flashcards.services import (
     CollectionCycleError,
     CollectionService,
     CrossOwnerParentError,
+    DocumentExtractionFailedError,
     FREE_FLASHCARD_LIMIT,
     FlashcardService,
     GoalService,
     MAX_AI_GENERATE_COUNT,
     MAX_AI_REGENERATE_COUNT,
     MAX_EXISTING_CARDS_CONTEXT,
+    MAX_EXTRACTED_CHARS_PER_DOCUMENT,
     MAX_LEARNING_REQUEST_LENGTH,
+    MAX_PENDING_SOURCE_DOCUMENTS_PER_USER,
+    MAX_SOURCE_DOCUMENTS_PER_REQUEST,
+    MAX_TOTAL_SOURCE_DOCUMENT_CHARS,
     ReviewService,
+    SourceDocumentService,
     StreakService,
+    TooManySourceDocumentsError,
+    UnsupportedDocumentError,
 )
 
 User = get_user_model()
@@ -78,6 +89,50 @@ def _make_pro_user(username='alice', email='alice@example.com'):
 def _basic_draft_cards(count, prefix='Q'):
     from flashcards.ai_providers.base import BasicCardDraft
     return [BasicCardDraft(prompt=f'{prefix}{i}?', answer=f'A{i}') for i in range(count)]
+
+
+def _build_minimal_pdf(page_texts):
+    """Builds a genuine, minimal, byte-valid PDF (real xref table, real
+    offsets) for exercising pypdf/pypdfium2 against real bytes rather than
+    mocking them away. `page_texts` is a list of str|None: a str embeds real
+    extractable text via a `Tj` content-stream operator; None yields a page
+    with an empty content stream (pypdf's extract_text() returns '' for it),
+    simulating a scanned/image-only page that has no embedded text layer.
+    """
+    n = len(page_texts)
+    first_page_obj_num = 4  # 1=catalog, 2=pages, 3=font
+    kids = ' '.join(f'{first_page_obj_num + i} 0 R' for i in range(n))
+    objects = [
+        '<< /Type /Catalog /Pages 2 0 R >>',
+        f'<< /Type /Pages /Kids [{kids}] /Count {n} >>',
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+    ]
+    page_objs, content_objs = [], []
+    next_num = first_page_obj_num + n
+    for i, text in enumerate(page_texts):
+        content_num = next_num + i
+        stream = f'BT /F1 12 Tf 20 100 Td ({text}) Tj ET' if text else ''
+        content_objs.append(f'<< /Length {len(stream)} >>\nstream\n{stream}\nendstream')
+        page_objs.append(
+            f'<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 3 0 R >> >> '
+            f'/MediaBox [0 0 200 200] /Contents {content_num} 0 R >>',
+        )
+    all_objects = objects + page_objs + content_objs
+
+    buf = io.BytesIO()
+    buf.write(b'%PDF-1.4\n')
+    offsets = [0]
+    for idx, body in enumerate(all_objects, start=1):
+        offsets.append(buf.tell())
+        buf.write(f'{idx} 0 obj\n{body}\nendobj\n'.encode('latin-1'))
+    xref_offset = buf.tell()
+    total_objs = len(all_objects) + 1
+    buf.write(f'xref\n0 {total_objs}\n'.encode('latin-1'))
+    buf.write(b'0000000000 65535 f \n')
+    for off in offsets[1:]:
+        buf.write(f'{off:010d} 00000 n \n'.encode('latin-1'))
+    buf.write(f'trailer\n<< /Size {total_objs} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF'.encode('latin-1'))
+    return buf.getvalue()
 
 
 class CollectionCRUDTests(ApiTestCase):
@@ -276,6 +331,98 @@ class FlashcardLimitTests(ApiTestCase):
         response = self._post_flashcard('Pro card?')
 
         self.assertEqual(response.status_code, 201)
+
+
+class FlashcardBulkCreateTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    def _bulk(self, cards):
+        return self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/flashcards/bulk/',
+            data=json.dumps({'cards': cards}),
+            content_type='application/json', **self.headers,
+        )
+
+    def test_creates_all_valid_cards_in_one_request(self):
+        cards = [{'card_type': 'basic', 'prompt': f'q{i}', 'answer': f'a{i}'} for i in range(10)]
+
+        response = self._bulk(cards)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body['created']), 10)
+        self.assertEqual(body['errors'], [])
+        self.assertFalse(body['limit_reached'])
+        self.assertEqual(Flashcard.objects.filter(collection=self.collection).count(), 10)
+
+    def test_invalid_card_reported_but_others_still_created(self):
+        cards = [
+            {'card_type': 'basic', 'prompt': 'good one', 'answer': 'a'},
+            {'card_type': 'basic', 'prompt': '', 'answer': 'a'},  # blank prompt -> invalid
+            {'card_type': 'basic', 'prompt': 'another good one', 'answer': 'b'},
+        ]
+
+        response = self._bulk(cards)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body['created']), 2)
+        self.assertEqual(len(body['errors']), 1)
+        self.assertEqual(body['errors'][0]['index'], 1)
+
+    def test_stops_creating_once_free_plan_limit_hit_but_reports_every_remaining_card(self):
+        Flashcard.objects.bulk_create([
+            Flashcard(collection=self.collection, card_type=Flashcard.CardType.BASIC, prompt=f'q{i}', answer=f'a{i}')
+            for i in range(FREE_FLASHCARD_LIMIT - 2)
+        ])
+        cards = [{'card_type': 'basic', 'prompt': f'new{i}', 'answer': 'a'} for i in range(5)]
+
+        response = self._bulk(cards)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(len(body['created']), 2)
+        self.assertEqual(len(body['errors']), 3)
+        self.assertTrue(body['limit_reached'])
+        self.assertEqual(Flashcard.objects.filter(collection=self.collection).count(), FREE_FLASHCARD_LIMIT)
+
+    def test_empty_list_is_400(self):
+        response = self._bulk([])
+        self.assertEqual(response.status_code, 400)
+
+    def test_over_max_batch_size_is_400(self):
+        cards = [{'card_type': 'basic', 'prompt': f'q{i}', 'answer': 'a'} for i in range(101)]
+
+        response = self._bulk(cards)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(Flashcard.objects.filter(collection=self.collection).exists())
+
+    def test_other_users_collection_is_404(self):
+        other = _make_user(username='bob', email='bob@example.com')
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{_make_collection(other).id}/flashcards/bulk/',
+            data=json.dumps({'cards': [{'card_type': 'basic', 'prompt': 'q', 'answer': 'a'}]}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_many_cards_in_one_request_does_not_trip_the_per_user_throttle(self):
+        # The whole point of this endpoint: importing a large deck must not
+        # cost one Django request per card (see its own docstring) -- a
+        # single request creating a full batch should never come anywhere
+        # near the 'user' scope's 120/min default rate limit on its own.
+        cards = [{'card_type': 'basic', 'prompt': f'q{i}', 'answer': f'a{i}'} for i in range(100)]
+
+        response = self._bulk(cards)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()['created']), 100)
 
 
 class MediaUploadFlowTests(ApiTestCase):
@@ -1441,6 +1588,35 @@ class AiGenerationDraftMutationTests(ApiTestCase):
 
         self.assertEqual(response.status_code, 400)
 
+    def test_confirm_clears_source_document_text_but_keeps_metadata(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, draft=self.draft,
+            filename='notes.txt', content_type='text/plain', size_bytes=10,
+            extracted_text='some extracted text', char_count=20,
+        )
+
+        response = self._post('confirm/', {})
+
+        self.assertEqual(response.status_code, 200)
+        document.refresh_from_db()
+        self.assertEqual(document.extracted_text, '')
+        self.assertEqual(document.filename, 'notes.txt')
+        self.assertEqual(document.char_count, 20)
+
+    def test_discard_clears_source_document_text_but_keeps_metadata(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, draft=self.draft,
+            filename='notes.txt', content_type='text/plain', size_bytes=10,
+            extracted_text='some extracted text', char_count=20,
+        )
+
+        response = self._post('discard/', {})
+
+        self.assertEqual(response.status_code, 200)
+        document.refresh_from_db()
+        self.assertEqual(document.extracted_text, '')
+        self.assertEqual(document.filename, 'notes.txt')
+
 
 class AiFlashcardGenerationServiceUnitTests(TestCase):
     def setUp(self):
@@ -1482,3 +1658,535 @@ class AiFlashcardGenerationServiceUnitTests(TestCase):
         self.assertIn('0 never studied', context)
         self.assertIn('1 mastered/in regular review', context)
         self.assertIn('1 total lapses', context)
+
+
+class SourceDocumentUploadFlowTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    @patch('flashcards.services.storage.generate_upload_url', return_value='https://bucket.example/presigned-put')
+    def test_upload_url_request_returns_presigned_url_and_key(self, mock_generate):
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/source-documents/upload-url/',
+            data=json.dumps({'content_type': 'application/pdf', 'filename': 'book.pdf', 'size_bytes': 1024}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['upload_url'], 'https://bucket.example/presigned-put')
+        self.assertTrue(
+            body['storage_key'].startswith(f'flashcards/{self.user.id}/source-documents/{self.collection.id}/'),
+        )
+        mock_generate.assert_called_once()
+
+    def test_upload_url_rejects_unsupported_content_type(self):
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/source-documents/upload-url/',
+            data=json.dumps({'content_type': 'application/zip', 'filename': 'file.zip', 'size_bytes': 1024}),
+            content_type='application/json', **self.headers,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_upload_url_rejects_oversized_file(self):
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/source-documents/upload-url/',
+            data=json.dumps({
+                'content_type': 'text/plain', 'filename': 'notes.txt',
+                'size_bytes': document_extraction.MAX_SIZE_BYTES['text/plain'] + 1,
+            }),
+            content_type='application/json', **self.headers,
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_pro_user_gets_402(self):
+        free_user = _make_user(username='free', email='free@example.com')
+        collection = _make_collection(free_user)
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{collection.id}/source-documents/upload-url/',
+            data=json.dumps({'content_type': 'text/plain', 'filename': 'notes.txt', 'size_bytes': 10}),
+            content_type='application/json', **_auth_headers(free_user),
+        )
+        self.assertEqual(response.status_code, 402)
+
+
+class SourceDocumentConfirmTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    def _confirm(self, **overrides):
+        payload = {
+            'storage_key': 'source-documents/1/1/abc.txt', 'content_type': 'text/plain',
+            'filename': 'notes.txt', 'size_bytes': 11,
+        }
+        payload.update(overrides)
+        return self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/source-documents/confirm/',
+            data=json.dumps(payload), content_type='application/json', **self.headers,
+        )
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object', return_value=b'hello world')
+    def test_confirm_txt_creates_row_with_correct_char_count(self, mock_download, mock_delete):
+        response = self._confirm()
+
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(body['char_count'], len('hello world'))
+        self.assertEqual(body['filename'], 'notes.txt')
+        document = GenerationSourceDocument.objects.get(id=body['id'])
+        self.assertEqual(document.extracted_text, 'hello world')
+        mock_delete.assert_called_once_with(key='source-documents/1/1/abc.txt')
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object')
+    def test_confirm_pdf_with_real_text_layer(self, mock_download, mock_delete):
+        mock_download.return_value = _build_minimal_pdf(['Hello World, this is a real embedded text layer.'])
+
+        response = self._confirm(content_type='application/pdf', filename='book.pdf', size_bytes=1000)
+
+        self.assertEqual(response.status_code, 201)
+        document = GenerationSourceDocument.objects.get(id=response.json()['id'])
+        self.assertIn('Hello World', document.extracted_text)
+        mock_delete.assert_called_once()
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object', return_value=b'not a real pdf')
+    def test_confirm_corrupt_pdf_is_400_and_still_deletes_object(self, mock_download, mock_delete):
+        response = self._confirm(content_type='application/pdf', filename='book.pdf', size_bytes=100)
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(GenerationSourceDocument.objects.exists())
+        mock_delete.assert_called_once_with(key='source-documents/1/1/abc.txt')
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object', return_value=b'x' * (MAX_EXTRACTED_CHARS_PER_DOCUMENT + 500))
+    def test_confirm_truncates_extremely_long_text(self, mock_download, mock_delete):
+        response = self._confirm(size_bytes=MAX_EXTRACTED_CHARS_PER_DOCUMENT + 500)
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['char_count'], MAX_EXTRACTED_CHARS_PER_DOCUMENT)
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object', return_value=b'x')
+    def test_too_many_pending_documents_is_400(self, mock_download, mock_delete):
+        for i in range(MAX_PENDING_SOURCE_DOCUMENTS_PER_USER):
+            GenerationSourceDocument.objects.create(
+                user=self.user, collection=self.collection, filename=f'f{i}.txt',
+                content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+            )
+
+        response = self._confirm()
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_non_pro_user_gets_402(self):
+        free_user = _make_user(username='free', email='free@example.com')
+        collection = _make_collection(free_user)
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{collection.id}/source-documents/confirm/',
+            data=json.dumps({
+                'storage_key': 'x', 'content_type': 'text/plain', 'filename': 'a.txt', 'size_bytes': 1,
+            }),
+            content_type='application/json', **_auth_headers(free_user),
+        )
+        self.assertEqual(response.status_code, 402)
+
+
+class SourceDocumentDeleteTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    def test_delete_removes_unlinked_document(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, filename='a.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        response = self.client.delete(f'/api/flashcards/source-documents/{document.id}/', **self.headers)
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(GenerationSourceDocument.objects.filter(id=document.id).exists())
+
+    def test_delete_other_users_document_is_404(self):
+        other = _make_pro_user(username='bob', email='bob@example.com')
+        document = GenerationSourceDocument.objects.create(
+            user=other, collection=_make_collection(other), filename='a.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        response = self.client.delete(f'/api/flashcards/source-documents/{document.id}/', **self.headers)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_delete_already_used_document_is_404(self):
+        draft = FlashcardGenerationDraft.objects.create(
+            user=self.user, collection=self.collection, card_type=Flashcard.CardType.BASIC, learning_request='x',
+        )
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, draft=draft, filename='a.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        response = self.client.delete(f'/api/flashcards/source-documents/{document.id}/', **self.headers)
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_update_text_corrects_extraction_and_recomputes_char_count(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, filename='photo.jpg',
+            content_type='image/jpeg', size_bytes=1, extracted_text='mis-read tex t', char_count=15,
+        )
+
+        response = self.client.patch(
+            f'/api/flashcards/source-documents/{document.id}/',
+            data=json.dumps({'extracted_text': 'corrected text'}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body['extracted_text'], 'corrected text')
+        self.assertEqual(body['char_count'], len('corrected text'))
+        document.refresh_from_db()
+        self.assertEqual(document.extracted_text, 'corrected text')
+        self.assertEqual(document.char_count, len('corrected text'))
+
+    def test_update_text_truncates_to_max_length(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, filename='notes.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        response = self.client.patch(
+            f'/api/flashcards/source-documents/{document.id}/',
+            data=json.dumps({'extracted_text': 'y' * (MAX_EXTRACTED_CHARS_PER_DOCUMENT + 100)}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['char_count'], MAX_EXTRACTED_CHARS_PER_DOCUMENT)
+
+    def test_update_text_on_already_used_document_is_404(self):
+        draft = FlashcardGenerationDraft.objects.create(
+            user=self.user, collection=self.collection, card_type=Flashcard.CardType.BASIC, learning_request='x',
+        )
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, draft=draft, filename='a.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        response = self.client.patch(
+            f'/api/flashcards/source-documents/{document.id}/',
+            data=json.dumps({'extracted_text': 'new text'}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+    def test_update_other_users_document_is_404(self):
+        other = _make_pro_user(username='carol', email='carol@example.com')
+        document = GenerationSourceDocument.objects.create(
+            user=other, collection=_make_collection(other), filename='a.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        response = self.client.patch(
+            f'/api/flashcards/source-documents/{document.id}/',
+            data=json.dumps({'extracted_text': 'new text'}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 404)
+
+
+class DescribeImageWithFallbackTests(TestCase):
+    @patch('flashcards.ai_providers.GeminiProvider.describe_image')
+    @patch('flashcards.ai_providers.ClaudeProvider.describe_image')
+    def test_claude_success_gemini_never_called(self, mock_claude, mock_gemini):
+        mock_claude.return_value = 'transcribed text'
+
+        from flashcards import ai_providers
+        result = ai_providers.describe_image_with_fallback(image_bytes=b'x', media_type='image/png')
+
+        self.assertEqual(result, 'transcribed text')
+        mock_gemini.assert_not_called()
+
+    @patch('flashcards.ai_providers.GeminiProvider.describe_image')
+    @patch('flashcards.ai_providers.ClaudeProvider.describe_image')
+    def test_claude_unavailable_falls_back_to_gemini(self, mock_claude, mock_gemini):
+        mock_claude.side_effect = ProviderUnavailableError('rate limited')
+        mock_gemini.return_value = 'gemini text'
+
+        from flashcards import ai_providers
+        result = ai_providers.describe_image_with_fallback(image_bytes=b'x', media_type='image/png')
+
+        self.assertEqual(result, 'gemini text')
+
+    @patch('flashcards.ai_providers.GeminiProvider.describe_image')
+    @patch('flashcards.ai_providers.ClaudeProvider.describe_image')
+    def test_both_unavailable_raises_clear_error(self, mock_claude, mock_gemini):
+        mock_claude.side_effect = ProviderUnavailableError('rate limited')
+        mock_gemini.side_effect = ProviderUnavailableError('also unavailable')
+
+        from flashcards import ai_providers
+        with self.assertRaises(AiGenerationError):
+            ai_providers.describe_image_with_fallback(image_bytes=b'x', media_type='image/png')
+
+
+class ScannedPdfExtractionTests(TestCase):
+    @patch('flashcards.document_extraction.ai_providers.describe_image_with_fallback')
+    def test_scanned_page_triggers_vision_fallback(self, mock_describe):
+        mock_describe.return_value = 'transcribed handwriting'
+        data = _build_minimal_pdf([None])
+
+        text = document_extraction.extract_text(content_type='application/pdf', data=data)
+
+        self.assertEqual(text, 'transcribed handwriting')
+        mock_describe.assert_called_once()
+        self.assertEqual(mock_describe.call_args.kwargs['media_type'], 'image/png')
+
+    @patch('flashcards.document_extraction.ai_providers.describe_image_with_fallback')
+    def test_mixed_pdf_only_ocrs_the_blank_page(self, mock_describe):
+        mock_describe.return_value = 'ocr text'
+        data = _build_minimal_pdf(['Real embedded text here', None])
+
+        text = document_extraction.extract_text(content_type='application/pdf', data=data)
+
+        mock_describe.assert_called_once()
+        self.assertIn('Real embedded text here', text)
+        self.assertIn('ocr text', text)
+
+    @patch('flashcards.document_extraction.ai_providers.describe_image_with_fallback')
+    def test_ocr_page_cap_is_respected(self, mock_describe):
+        mock_describe.return_value = 'ocr text'
+        page_count = document_extraction.MAX_OCR_PAGES_PER_DOCUMENT + 2
+        data = _build_minimal_pdf([None] * page_count)
+
+        text = document_extraction.extract_text(content_type='application/pdf', data=data)
+
+        self.assertEqual(mock_describe.call_count, document_extraction.MAX_OCR_PAGES_PER_DOCUMENT)
+        self.assertTrue(text)
+
+    def test_encrypted_pdf_is_rejected(self):
+        reader_data = _build_minimal_pdf(['secret'])
+        with patch('flashcards.document_extraction.pypdf.PdfReader') as mock_reader_cls:
+            mock_reader = SimpleNamespace(is_encrypted=True, pages=[])
+            mock_reader_cls.return_value = mock_reader
+            with self.assertRaises(document_extraction.DocumentExtractionError):
+                document_extraction.extract_text(content_type='application/pdf', data=reader_data)
+
+    @patch('flashcards.document_extraction.ai_providers.describe_image_with_fallback')
+    def test_vision_failure_on_all_providers_raises_extraction_error(self, mock_describe):
+        mock_describe.side_effect = AiGenerationError('all providers down')
+        data = _build_minimal_pdf([None])
+
+        with self.assertRaises(document_extraction.DocumentExtractionError):
+            document_extraction.extract_text(content_type='application/pdf', data=data)
+
+
+class StandaloneImageExtractionTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object', return_value=b'fake-image-bytes')
+    @patch('flashcards.document_extraction.ai_providers.describe_image_with_fallback')
+    def test_image_confirm_returns_transcription_as_extracted_text(self, mock_describe, mock_download, mock_delete):
+        mock_describe.return_value = 'a page of handwritten notes about photosynthesis'
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/source-documents/confirm/',
+            data=json.dumps({
+                'storage_key': 'source-documents/1/1/photo.png', 'content_type': 'image/png',
+                'filename': 'photo.png', 'size_bytes': 500,
+            }),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        document = GenerationSourceDocument.objects.get(id=response.json()['id'])
+        self.assertEqual(document.extracted_text, 'a page of handwritten notes about photosynthesis')
+
+    @patch('flashcards.services.storage.delete_object')
+    @patch('flashcards.services.storage.download_object', return_value=b'fake-image-bytes')
+    @patch('flashcards.document_extraction.ai_providers.describe_image_with_fallback')
+    def test_image_confirm_both_providers_failing_is_400_no_row_created(self, mock_describe, mock_download, mock_delete):
+        mock_describe.side_effect = AiGenerationError('all vision providers down')
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/source-documents/confirm/',
+            data=json.dumps({
+                'storage_key': 'source-documents/1/1/photo.jpg', 'content_type': 'image/jpeg',
+                'filename': 'photo.jpg', 'size_bytes': 500,
+            }),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(GenerationSourceDocument.objects.exists())
+        mock_delete.assert_called_once()
+
+
+class AiGenerationWithSourceDocumentsTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.headers = _auth_headers(self.user)
+        self.collection = _make_collection(self.user)
+
+    def _make_document(self, text='Extracted book chapter text', **kwargs):
+        defaults = {
+            'user': self.user, 'collection': self.collection, 'filename': 'chapter.pdf',
+            'content_type': 'application/pdf', 'size_bytes': 100,
+            'extracted_text': text, 'char_count': len(text),
+        }
+        defaults.update(kwargs)
+        return GenerationSourceDocument.objects.create(**defaults)
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_generate_with_only_documents_succeeds(self, mock_generate):
+        document = self._make_document()
+        mock_generate.return_value = _basic_draft_cards(2)
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/ai-generate/',
+            data=json.dumps({
+                'card_type': 'basic', 'count': 2, 'learning_request': '',
+                'source_document_ids': [document.id],
+            }),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        document.refresh_from_db()
+        self.assertEqual(document.draft_id, response.json()['id'])
+        self.assertEqual(response.json()['source_documents'][0]['filename'], 'chapter.pdf')
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_generate_with_no_request_and_no_documents_is_400(self, mock_generate):
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/ai-generate/',
+            data=json.dumps({'card_type': 'basic', 'count': 2, 'learning_request': ''}),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mock_generate.assert_not_called()
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_too_many_documents_per_request_is_400(self, mock_generate):
+        ids = [self._make_document(filename=f'f{i}.pdf').id for i in range(MAX_SOURCE_DOCUMENTS_PER_REQUEST + 1)]
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/ai-generate/',
+            data=json.dumps({
+                'card_type': 'basic', 'count': 2, 'learning_request': 'x', 'source_document_ids': ids,
+            }),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mock_generate.assert_not_called()
+
+    @patch('flashcards.ai_generation.generate_cards')
+    def test_combined_char_limit_over_max_is_400(self, mock_generate):
+        document = self._make_document(text='x' * (MAX_TOTAL_SOURCE_DOCUMENT_CHARS + 1))
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/ai-generate/',
+            data=json.dumps({
+                'card_type': 'basic', 'count': 2, 'learning_request': 'x',
+                'source_document_ids': [document.id],
+            }),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        mock_generate.assert_not_called()
+
+    @patch('flashcards.ai_generation.generate_with_fallback')
+    def test_prompt_includes_source_documents_tag(self, mock_fallback):
+        document = self._make_document(text='Photosynthesis converts light into chemical energy.')
+        mock_fallback.return_value = BasicCardBatch(cards=[{'prompt': 'Q', 'answer': 'A'}])
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{self.collection.id}/ai-generate/',
+            data=json.dumps({
+                'card_type': 'basic', 'count': 1, 'learning_request': '',
+                'source_document_ids': [document.id],
+            }),
+            content_type='application/json', **self.headers,
+        )
+
+        self.assertEqual(response.status_code, 201)
+        user_content = mock_fallback.call_args.kwargs['user_content']
+        self.assertIn('<source_documents untrusted="true">', user_content)
+        self.assertIn('Photosynthesis converts light into chemical energy.', user_content)
+        self.assertIn('chapter.pdf', user_content)
+
+    def test_non_pro_user_gets_402(self):
+        free_user = _make_user(username='free', email='free@example.com')
+        collection = _make_collection(free_user)
+
+        response = self.client.post(
+            f'/api/flashcards/collections/{collection.id}/ai-generate/',
+            data=json.dumps({'card_type': 'basic', 'count': 2, 'learning_request': 'x'}),
+            content_type='application/json', **_auth_headers(free_user),
+        )
+
+        self.assertEqual(response.status_code, 402)
+
+
+class CleanupStaleSourceDocumentsCommandTests(TestCase):
+    def setUp(self):
+        self.user = _make_pro_user()
+        self.collection = _make_collection(self.user)
+
+    def test_old_unlinked_document_is_deleted(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, filename='old.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+        GenerationSourceDocument.objects.filter(pk=document.pk).update(
+            created_at=timezone.now() - timedelta(hours=48),
+        )
+
+        call_command('cleanup_stale_source_documents', older_than_hours=24)
+
+        self.assertFalse(GenerationSourceDocument.objects.filter(pk=document.pk).exists())
+
+    def test_fresh_unlinked_document_survives(self):
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, filename='new.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+
+        call_command('cleanup_stale_source_documents', older_than_hours=24)
+
+        self.assertTrue(GenerationSourceDocument.objects.filter(pk=document.pk).exists())
+
+    def test_old_linked_document_survives(self):
+        draft = FlashcardGenerationDraft.objects.create(
+            user=self.user, collection=self.collection, card_type=Flashcard.CardType.BASIC, learning_request='x',
+        )
+        document = GenerationSourceDocument.objects.create(
+            user=self.user, collection=self.collection, draft=draft, filename='old.txt',
+            content_type='text/plain', size_bytes=1, extracted_text='x', char_count=1,
+        )
+        GenerationSourceDocument.objects.filter(pk=document.pk).update(
+            created_at=timezone.now() - timedelta(hours=48),
+        )
+
+        call_command('cleanup_stale_source_documents', older_than_hours=24)
+
+        self.assertTrue(GenerationSourceDocument.objects.filter(pk=document.pk).exists())
