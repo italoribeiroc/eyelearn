@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from . import storage
-from .models import Collection, CollectionGoal, Flashcard, FlashcardMedia, ReviewLog
+from .models import Collection, CollectionGoal, Flashcard, FlashcardMedia, GenerationSourceDocument, ReviewLog
 from .services import ReviewService
 
 
@@ -98,7 +98,50 @@ class AiGenerationRequestSerializer(serializers.Serializer):
     # since "required" is conditional on another field.
     count = serializers.IntegerField(required=False, allow_null=True)
     auto = serializers.BooleanField(required=False, default=False)
-    learning_request = serializers.CharField()
+    # Optional: a generation can now rely entirely on attached source
+    # documents (see source_document_ids) instead of typed text -- "at least
+    # one of the two" is enforced in AiFlashcardGenerationService.generate.
+    learning_request = serializers.CharField(required=False, allow_blank=True, default='')
+    source_document_ids = serializers.ListField(
+        child=serializers.IntegerField(), required=False, default=list,
+    )
+
+
+class SourceDocumentUploadURLRequestSerializer(serializers.Serializer):
+    content_type = serializers.CharField()
+    filename = serializers.CharField()
+    size_bytes = serializers.IntegerField(min_value=1)
+
+
+class SourceDocumentConfirmSerializer(serializers.Serializer):
+    storage_key = serializers.CharField()
+    content_type = serializers.CharField()
+    filename = serializers.CharField()
+    size_bytes = serializers.IntegerField(min_value=1)
+
+
+class SourceDocumentUpdateTextSerializer(serializers.Serializer):
+    extracted_text = serializers.CharField(allow_blank=True)
+
+
+class GenerationSourceDocumentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GenerationSourceDocument
+        fields = ['id', 'filename', 'content_type', 'size_bytes', 'char_count', 'created_at']
+        read_only_fields = fields
+
+
+class GenerationSourceDocumentDetailSerializer(GenerationSourceDocumentSerializer):
+    """Adds the actual extracted/transcribed text, so the uploader can check
+    (and, via source_document_update, correct) what the server read from
+    their file -- most useful for a photo or scanned page, where the vision
+    fallback can occasionally misread something. Deliberately not used in
+    _serialize_draft (views.py), which is polled repeatedly while a
+    generation is running: only the upload-confirm and update responses
+    need the full text, not every draft-status poll."""
+
+    class Meta(GenerationSourceDocumentSerializer.Meta):
+        fields = GenerationSourceDocumentSerializer.Meta.fields + ['extracted_text']
 
 
 class AiRegenerateRequestSerializer(serializers.Serializer):

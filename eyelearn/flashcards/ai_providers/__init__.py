@@ -17,6 +17,19 @@ logger = logging.getLogger(__name__)
 # reliable of the three when it does have to run.
 _PROVIDERS = [ClaudeProvider(), GeminiProvider(), GroqProvider()]
 
+# Vision (image understanding) fallback, used for OCR/description of scanned
+# PDF pages and standalone photo uploads (see flashcards/document_extraction.py).
+# Groq is excluded: its configured model (see groq_provider.py's MODEL) is
+# text-only, so it's simply not part of this chain -- this doesn't affect
+# the card-generation fallback above at all.
+_VISION_PROVIDERS = [ClaudeProvider(), GeminiProvider()]
+
+_VISION_PROMPT = (
+    'Transcribe all text visible in this image exactly as written, including any handwriting. '
+    'Also describe any diagrams, charts, tables, or figures in enough detail that someone could '
+    'write study questions about them. Output plain text only, no commentary about the image itself.'
+)
+
 # Records which provider actually served the most recent successful
 # generate_with_fallback() call, so a view can report it (e.g. as a
 # response header, for developers to check which provider is live without
@@ -56,3 +69,21 @@ def generate_with_fallback(*, system, user_content, response_model):
         return result
 
     raise AiGenerationError(f'All AI providers are currently unavailable: {last_error}')
+
+
+def describe_image_with_fallback(*, image_bytes, media_type):
+    """Claude -> Gemini fallback for image understanding (see _VISION_PROVIDERS
+    above). Same fallback shape as generate_with_fallback, but returns plain
+    text rather than a parsed Pydantic model, and doesn't touch
+    _last_provider_used -- this powers document extraction, not card
+    generation, so it's not what the X-AI-Provider response header reports."""
+    last_error = None
+    for provider in _VISION_PROVIDERS:
+        try:
+            return provider.describe_image(image_bytes=image_bytes, media_type=media_type, prompt=_VISION_PROMPT)
+        except ProviderUnavailableError as exc:
+            logger.warning('Vision provider %s unavailable, trying next: %s', provider.name(), exc)
+            last_error = exc
+            continue
+
+    raise AiGenerationError(f'All vision-capable AI providers are currently unavailable: {last_error}')
