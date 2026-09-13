@@ -50,6 +50,7 @@ from .services import (
     FlashcardService,
     GoalService,
     MediaService,
+    NoReviewToUndoError,
     ReviewService,
     SourceDocumentService,
     StreakService,
@@ -185,7 +186,12 @@ def flashcard_list(request, collection_id):
     collection = _user_collection_or_404(request.user, collection_id)
 
     if request.method == 'GET':
-        return Response(FlashcardSerializer(collection.flashcards.all(), many=True).data)
+        # prefetch_related avoids an N+1 on each flashcard's media (a plain
+        # reverse-FK nested serializer field, see FlashcardSerializer) --
+        # without it, a 1000+-card collection issued 1000+ extra queries here.
+        return Response(
+            FlashcardSerializer(collection.flashcards.all().prefetch_related('media'), many=True).data,
+        )
 
     serializer = FlashcardSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -521,6 +527,24 @@ def submit_review(request, flashcard_id):
 
     return Response({
         'correct': correct,
+        'due': review_state.due,
+        'state': review_state.state,
+        'reps': review_state.reps,
+        'lapses': review_state.lapses,
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def undo_review(request, flashcard_id):
+    flashcard = _user_flashcard_or_404(request.user, flashcard_id)
+
+    try:
+        review_state = ReviewService().undo_last_review(user=request.user, flashcard=flashcard)
+    except NoReviewToUndoError as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    return Response({
         'due': review_state.due,
         'state': review_state.state,
         'reps': review_state.reps,

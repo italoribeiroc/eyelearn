@@ -26,6 +26,7 @@ from .views import (
     streak_calendar,
     study_queue,
     submit_review,
+    undo_review,
 )
 
 urlpatterns = [
@@ -58,6 +59,7 @@ urlpatterns = [
     path('flashcards/<int:flashcard_id>/media/upload-url/', media_upload_url, name='media_upload_url'),
     path('flashcards/<int:flashcard_id>/media/confirm/', media_confirm, name='media_confirm'),
     path('flashcards/<int:flashcard_id>/review/', submit_review, name='submit_review'),
+    path('flashcards/<int:flashcard_id>/review/undo/', undo_review, name='undo_review'),
     path('media/<int:media_id>/', media_delete, name='media_delete'),
     path('source-documents/<int:document_id>/', source_document_detail, name='source_document_detail'),
 ]

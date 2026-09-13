@@ -1,4 +1,5 @@
 import os
+from functools import lru_cache
 from uuid import uuid4
 
 import boto3
@@ -9,7 +10,12 @@ from django.conf import settings
 # STORAGE_REGION), not a code change.
 
 
+@lru_cache(maxsize=None)
 def _client():
+    # Cached (not rebuilt per call): STORAGE_* settings are env-driven and
+    # fixed for the life of the process, and boto3 clients are safe to reuse
+    # across calls -- constructing a fresh one for every media row (e.g. once
+    # per flashcard when listing a large collection) was pure overhead.
     return boto3.client(
         's3',
         endpoint_url=settings.STORAGE_ENDPOINT_URL,

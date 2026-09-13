@@ -86,6 +86,10 @@ class TooManySourceDocumentsError(Exception):
     """Raised when a user has too many unlinked (not-yet-generated-from) source documents."""
 
 
+class NoReviewToUndoError(Exception):
+    """Raised when there's no recent-enough review left to undo for a card."""
+
+
 ALLOWED_CONTENT_TYPES = {
     FlashcardMedia.MediaType.IMAGE: {'image/png', 'image/jpeg', 'image/webp', 'image/gif'},
     FlashcardMedia.MediaType.AUDIO: {'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/wav'},
@@ -638,10 +642,25 @@ class ReviewService:
         )
         return review_state
 
-    def _ensure_review_states(self, *, user, flashcard_ids, now):
-        """Lazily backfills ReviewState rows (due=now) for any flashcard the
-        user has never reviewed, so newly-added cards count as due immediately.
+    def _needs_backfill(self, *, user, subtree_ids):
+        """Cheap existence check for whether every flashcard in this subtree
+        already has a ReviewState row for `user` -- two COUNT(*) aggregates,
+        no row materialization, so this costs the same regardless of how many
+        flashcards the subtree has. Used to skip the (real) backfill work
+        below on the overwhelmingly common path where nothing is missing.
         """
+        total = Flashcard.objects.filter(collection_id__in=subtree_ids).count()
+        reviewed = ReviewState.objects.filter(user=user, flashcard__collection_id__in=subtree_ids).count()
+        return total != reviewed
+
+    def _backfill_missing_review_states(self, *, user, subtree_ids, now):
+        """The actual backfill: only reached when _needs_backfill() found a
+        gap (new cards added since the subtree was last viewed, or this is
+        the very first view ever). Needs concrete flashcard ids -- unlike the
+        fast-path check above, bulk_create has no way around materializing
+        them.
+        """
+        flashcard_ids = list(Flashcard.objects.filter(collection_id__in=subtree_ids).values_list('id', flat=True))
         existing_ids = set(
             ReviewState.objects
             .filter(user=user, flashcard_id__in=flashcard_ids)
@@ -654,15 +673,28 @@ class ReviewService:
                 ignore_conflicts=True,
             )
 
+    def _ensure_review_states(self, *, user, subtree_ids, now):
+        """Lazily backfills ReviewState rows (due=now) for any flashcard the
+        user has never reviewed, so newly-added cards count as due
+        immediately -- but only actually queries/writes anything when
+        _needs_backfill() says there's a gap, since this runs on every
+        study-queue build and every due-count lookup (including once per
+        collection returned by the collections list), and paying two
+        full id-list round trips on every one of those calls -- even when
+        nothing is missing, which is almost always -- is what made opening a
+        large collection slow.
+        """
+        if self._needs_backfill(user=user, subtree_ids=subtree_ids):
+            self._backfill_missing_review_states(user=user, subtree_ids=subtree_ids, now=now)
+
     def build_study_queue(self, *, user, collection, limit=None, now=None):
         now = now or timezone.now()
         subtree_ids = CollectionService().get_subtree_ids(collection=collection)
-        flashcard_ids = list(Flashcard.objects.filter(collection_id__in=subtree_ids).values_list('id', flat=True))
-        self._ensure_review_states(user=user, flashcard_ids=flashcard_ids, now=now)
+        self._ensure_review_states(user=user, subtree_ids=subtree_ids, now=now)
 
         queryset = (
             ReviewState.objects
-            .filter(user=user, flashcard_id__in=flashcard_ids, due__lte=now)
+            .filter(user=user, flashcard__collection_id__in=subtree_ids, due__lte=now)
             .select_related('flashcard')
             .order_by('due')
         )
@@ -677,9 +709,10 @@ class ReviewService:
         """
         now = now or timezone.now()
         subtree_ids = CollectionService().get_subtree_ids(collection=collection)
-        flashcard_ids = list(Flashcard.objects.filter(collection_id__in=subtree_ids).values_list('id', flat=True))
-        self._ensure_review_states(user=user, flashcard_ids=flashcard_ids, now=now)
-        return ReviewState.objects.filter(user=user, flashcard_id__in=flashcard_ids, due__lte=now).count()
+        self._ensure_review_states(user=user, subtree_ids=subtree_ids, now=now)
+        return ReviewState.objects.filter(
+            user=user, flashcard__collection_id__in=subtree_ids, due__lte=now,
+        ).count()
 
     def build_multi_collection_queue(self, *, user, collection_ids, now=None, limit=None):
         """Union of due cards across several user-owned collections, deduped by
@@ -747,6 +780,78 @@ class ReviewService:
 
         return review_state, correct
 
+    # How long a review stays undoable. The frontend only ever offers the
+    # "go back" button for the card currently on screen (it disappears the
+    # moment the next card loads), so this is purely a defensive backstop
+    # against a stale button somehow surviving a long-abandoned session, not
+    # a feature in itself.
+    UNDO_WINDOW = timedelta(minutes=10)
+
+    def undo_last_review(self, *, user, flashcard):
+        """Reverts the single most recent review recorded for (user, flashcard):
+        restores ReviewState to the fsrs.Card snapshot ReviewLog.state_before
+        captured just before that review, deletes the log entry, and rolls
+        back the StudyDay counter it incremented -- so a mis-tapped rating
+        (Again/Hard/Good/Easy, or a wrong multiple-choice/typed-answer
+        submission) leaves no trace in the history that drives streaks,
+        goal pacing, or future FSRS re-optimization.
+
+        No redo, no multi-level undo stack -- only ever the single most
+        recent review, matching the "I mis-clicked, let me pick again" use
+        case this exists for.
+        """
+        with transaction.atomic():
+            try:
+                review_state = ReviewState.objects.select_for_update().get(user=user, flashcard=flashcard)
+            except ReviewState.DoesNotExist:
+                raise NoReviewToUndoError('This card has no review to undo.')
+
+            log = (
+                ReviewLog.objects
+                .filter(review_state=review_state)
+                .order_by('-reviewed_at', '-id')
+                .first()
+            )
+            if log is None or timezone.now() - log.reviewed_at > self.UNDO_WINDOW:
+                raise NoReviewToUndoError('This card has no review to undo.')
+
+            # Mirrors the lapse condition in submit_review, recomputed from
+            # the pre-review snapshot rather than trusted from the (now
+            # about-to-be-overwritten) current row.
+            previous_state = _FSRS_STATE_TO_OURS[fsrs.State(log.state_before['state'])]
+            was_lapse = previous_state == ReviewState.State.REVIEW and log.rating == ReviewLog.Rating.AGAIN
+
+            self._assign_fsrs_fields(review_state, fsrs.Card.from_dict(log.state_before))
+            review_state.reps = max(review_state.reps - 1, 0)
+            if review_state.reps == 0:
+                # _to_fsrs_card special-cases reps==0 as a fresh fsrs.Card(),
+                # which already reports state=Learning -- that's what got
+                # snapshotted into state_before and just got restored above.
+                # Overwrite it back to our own "untouched" state so undoing a
+                # card's first-ever review doesn't leave it looking like it
+                # had progressed, even though scheduling-wise (the reps==0
+                # check) it's already treated as brand new either way.
+                review_state.state = ReviewState.State.NEW
+            if was_lapse:
+                review_state.lapses = max(review_state.lapses - 1, 0)
+            review_state.save()
+
+            reviewed_date = log.reviewed_at.date()
+            log.delete()
+
+            study_day = StudyDay.objects.filter(user=user, date=reviewed_date).first()
+            if study_day:
+                if study_day.cards_reviewed <= 1:
+                    # Zero left for that day -- delete the row entirely, not
+                    # just zero the counter, so StreakService (which treats
+                    # "a StudyDay row exists" as "studied that day") doesn't
+                    # keep counting a day whose only review was undone.
+                    study_day.delete()
+                else:
+                    StudyDay.objects.filter(pk=study_day.pk).update(cards_reviewed=F('cards_reviewed') - 1)
+
+        return review_state
+
     def _check_multiple_choice(self, flashcard, selected_option):
         options = flashcard.options or []
         if selected_option is None or not (0 <= selected_option < len(options)):
@@ -772,13 +877,17 @@ class ReviewService:
             last_review=review_state.last_review,
         )
 
-    def _apply_card_to_state(self, review_state, card):
+    def _assign_fsrs_fields(self, review_state, card):
         review_state.step = card.step
         review_state.stability = card.stability
         review_state.difficulty = card.difficulty
         review_state.due = card.due
         review_state.last_review = card.last_review
         review_state.state = _FSRS_STATE_TO_OURS[card.state]
+        return review_state
+
+    def _apply_card_to_state(self, review_state, card):
+        self._assign_fsrs_fields(review_state, card)
         review_state.reps += 1
         return review_state
 

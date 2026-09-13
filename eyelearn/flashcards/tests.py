@@ -47,6 +47,7 @@ from flashcards.services import (
     MAX_PENDING_SOURCE_DOCUMENTS_PER_USER,
     MAX_SOURCE_DOCUMENTS_PER_REQUEST,
     MAX_TOTAL_SOURCE_DOCUMENT_CHARS,
+    NoReviewToUndoError,
     ReviewService,
     SourceDocumentService,
     StreakService,
@@ -284,6 +285,35 @@ class FlashcardCRUDTests(ApiTestCase):
         response = self.client.get(f'/api/flashcards/flashcards/{flashcard.id}/', **self.headers)
 
         self.assertEqual(response.status_code, 404)
+
+    @patch('flashcards.serializers.storage.generate_download_url', return_value='https://bucket.example/get')
+    def test_list_query_count_is_independent_of_flashcard_and_media_count(self, mock_generate):
+        # Regression guard for the media N+1 (flashcard_list's GET branch
+        # used to issue one extra query per flashcard for its .media.all()).
+        def make_cards_with_media(count):
+            for i in range(count):
+                flashcard = _make_flashcard(self.collection)
+                FlashcardMedia.objects.create(
+                    flashcard=flashcard, media_type=FlashcardMedia.MediaType.IMAGE,
+                    side=FlashcardMedia.Side.PROMPT, storage_key=f'k{flashcard.id}',
+                    content_type='image/png', size_bytes=100,
+                )
+
+        make_cards_with_media(3)
+        with self.assertNumQueries(4):
+            response = self.client.get(
+                f'/api/flashcards/collections/{self.collection.id}/flashcards/', **self.headers,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 3)
+
+        make_cards_with_media(20)
+        with self.assertNumQueries(4):
+            response = self.client.get(
+                f'/api/flashcards/collections/{self.collection.id}/flashcards/', **self.headers,
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.json()), 23)
 
 
 class FlashcardLimitTests(ApiTestCase):
@@ -574,6 +604,174 @@ class ReviewSchedulingTests(ApiTestCase):
         body = response.json()
         self.assertIsNone(body['correct'])
         self.assertEqual(body['reps'], 1)
+
+
+class ReviewServiceQueryCountTests(ApiTestCase):
+    """Regression guard for the ReviewState-backfill-check cost that made
+    opening (or listing) a large collection slow: count_due/build_study_queue
+    used to pay two full flashcard-id-list round trips on every call, even
+    when nothing needed backfilling. The fast (already-backfilled) path
+    should now cost the same fixed number of queries regardless of how many
+    flashcards the collection has.
+    """
+
+    def setUp(self):
+        self.user = _make_user()
+        self.service = ReviewService()
+
+    def _collection_with_cards(self, count, name='Deck'):
+        collection = _make_collection(self.user, name=name)
+        for _ in range(count):
+            _make_flashcard(collection)
+        return collection
+
+    def test_count_due_fast_path_query_count_is_independent_of_flashcard_count(self):
+        small = self._collection_with_cards(5, name='Small')
+        large = self._collection_with_cards(500, name='Large')
+        # Prime both -- first call ever always backfills.
+        self.service.count_due(user=self.user, collection=small)
+        self.service.count_due(user=self.user, collection=large)
+
+        with self.assertNumQueries(4):
+            self.service.count_due(user=self.user, collection=small)
+        with self.assertNumQueries(4):
+            self.service.count_due(user=self.user, collection=large)
+
+    def test_count_due_backfill_path_still_creates_missing_review_states(self):
+        collection = self._collection_with_cards(10)
+        self.assertEqual(ReviewState.objects.filter(user=self.user).count(), 0)
+
+        due = self.service.count_due(user=self.user, collection=collection)
+
+        self.assertEqual(due, 10)
+        self.assertEqual(ReviewState.objects.filter(user=self.user).count(), 10)
+
+    def test_count_due_backfills_only_newly_added_cards(self):
+        collection = self._collection_with_cards(5)
+        self.service.count_due(user=self.user, collection=collection)
+        self.assertEqual(ReviewState.objects.filter(user=self.user).count(), 5)
+
+        _make_flashcard(collection)  # simulate a card added after the first view
+
+        due = self.service.count_due(user=self.user, collection=collection)
+
+        self.assertEqual(due, 6)
+        self.assertEqual(ReviewState.objects.filter(user=self.user).count(), 6)
+
+    def test_build_study_queue_fast_path_query_count_is_independent_of_flashcard_count(self):
+        small = self._collection_with_cards(5, name='Small')
+        large = self._collection_with_cards(300, name='Large')
+        self.service.build_study_queue(user=self.user, collection=small)
+        self.service.build_study_queue(user=self.user, collection=large)
+
+        with self.assertNumQueries(4):
+            self.service.build_study_queue(user=self.user, collection=small)
+        with self.assertNumQueries(4):
+            self.service.build_study_queue(user=self.user, collection=large)
+
+
+class ReviewUndoTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.collection = _make_collection(self.user)
+        self.service = ReviewService()
+
+    def test_undo_restores_reps_and_clears_log(self):
+        flashcard = _make_flashcard(self.collection)
+        self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.GOOD)
+
+        review_state = self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+        self.assertEqual(review_state.reps, 0)
+        self.assertIsNone(review_state.last_review)
+        self.assertFalse(ReviewLog.objects.filter(review_state=review_state).exists())
+
+    def test_undo_of_first_ever_review_restores_new_state(self):
+        flashcard = _make_flashcard(self.collection)
+        self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.GOOD)
+
+        review_state = self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+        self.assertEqual(review_state.state, ReviewState.State.NEW)
+
+    def test_undo_reverts_a_lapse(self):
+        flashcard = _make_flashcard(self.collection)
+        review_state, _ = self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.GOOD)
+        review_state.state = ReviewState.State.REVIEW
+        review_state.save()
+        review_state, _ = self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.AGAIN)
+        self.assertEqual(review_state.lapses, 1)
+
+        review_state = self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+        self.assertEqual(review_state.lapses, 0)
+
+    def test_undo_deletes_study_day_when_it_was_the_only_review_that_day(self):
+        flashcard = _make_flashcard(self.collection)
+        self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.GOOD)
+        today = timezone.now().date()
+        self.assertEqual(StudyDay.objects.get(user=self.user, date=today).cards_reviewed, 1)
+
+        self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+        self.assertFalse(StudyDay.objects.filter(user=self.user, date=today).exists())
+
+    def test_undo_decrements_study_day_when_other_reviews_remain(self):
+        flashcard_one = _make_flashcard(self.collection)
+        flashcard_two = _make_flashcard(self.collection)
+        self.service.submit_review(user=self.user, flashcard=flashcard_one, rating=ReviewLog.Rating.GOOD)
+        self.service.submit_review(user=self.user, flashcard=flashcard_two, rating=ReviewLog.Rating.GOOD)
+        today = timezone.now().date()
+
+        self.service.undo_last_review(user=self.user, flashcard=flashcard_one)
+
+        self.assertEqual(StudyDay.objects.get(user=self.user, date=today).cards_reviewed, 1)
+
+    def test_undo_with_no_review_raises(self):
+        flashcard = _make_flashcard(self.collection)
+
+        with self.assertRaises(NoReviewToUndoError):
+            self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+    def test_undo_twice_raises_the_second_time(self):
+        flashcard = _make_flashcard(self.collection)
+        self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.GOOD)
+        self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+        with self.assertRaises(NoReviewToUndoError):
+            self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+    def test_undo_outside_the_time_window_raises(self):
+        flashcard = _make_flashcard(self.collection)
+        review_state, _ = self.service.submit_review(user=self.user, flashcard=flashcard, rating=ReviewLog.Rating.GOOD)
+        stale_time = timezone.now() - self.service.UNDO_WINDOW - timedelta(minutes=1)
+        ReviewLog.objects.filter(review_state=review_state).update(reviewed_at=stale_time)
+
+        with self.assertRaises(NoReviewToUndoError):
+            self.service.undo_last_review(user=self.user, flashcard=flashcard)
+
+    def test_undo_endpoint_returns_updated_state(self):
+        flashcard = _make_flashcard(self.collection)
+        self.client.post(
+            f'/api/flashcards/flashcards/{flashcard.id}/review/',
+            data=json.dumps({'rating': 3}), content_type='application/json', **_auth_headers(self.user),
+        )
+
+        response = self.client.post(
+            f'/api/flashcards/flashcards/{flashcard.id}/review/undo/', **_auth_headers(self.user),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()['reps'], 0)
+
+    def test_undo_endpoint_with_no_review_returns_400(self):
+        flashcard = _make_flashcard(self.collection)
+
+        response = self.client.post(
+            f'/api/flashcards/flashcards/{flashcard.id}/review/undo/', **_auth_headers(self.user),
+        )
+
+        self.assertEqual(response.status_code, 400)
 
 
 class StudyQueueTests(ApiTestCase):
