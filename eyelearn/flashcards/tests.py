@@ -21,6 +21,8 @@ from flashcards.ai_providers.base import AiGenerationError, BasicCardAutoBatch, 
 from flashcards.models import (
     Collection,
     CollectionGoal,
+    Exam,
+    ExamQuestion,
     Flashcard,
     FlashcardGenerationDraft,
     FlashcardMedia,
@@ -49,6 +51,7 @@ from flashcards.services import (
     MAX_TOTAL_SOURCE_DOCUMENT_CHARS,
     NoReviewToUndoError,
     ReviewService,
+    check_multiple_choice,
     SourceDocumentService,
     StreakService,
     TooManySourceDocumentsError,
@@ -2388,3 +2391,437 @@ class CleanupStaleSourceDocumentsCommandTests(TestCase):
         call_command('cleanup_stale_source_documents', older_than_hours=24)
 
         self.assertTrue(GenerationSourceDocument.objects.filter(pk=document.pk).exists())
+
+
+
+class CheckMultipleChoiceTests(TestCase):
+    OPTIONS = [{'text': 'a', 'is_correct': False}, {'text': 'b', 'is_correct': True}]
+
+    def test_correct_wrong_and_out_of_range(self):
+        self.assertTrue(check_multiple_choice(self.OPTIONS, 1))
+        self.assertFalse(check_multiple_choice(self.OPTIONS, 0))
+        self.assertFalse(check_multiple_choice(self.OPTIONS, 2))
+        self.assertFalse(check_multiple_choice(self.OPTIONS, -1))
+        self.assertFalse(check_multiple_choice(self.OPTIONS, None))
+        self.assertFalse(check_multiple_choice(None, 0))
+
+
+class ExamApiTests(ApiTestCase):
+    def setUp(self):
+        self.user = _make_user()
+        self.headers = _auth_headers(self.user)
+        self.other = _make_user('bob', 'bob@example.com')
+        self.other_headers = _auth_headers(self.other)
+
+        self.root = _make_collection(self.user, 'Root')
+        self.child = _make_collection(self.user, 'Child', parent=self.root)
+        self.basic = _make_flashcard(self.root, prompt='basic q', answer='basic a')
+        self.mc = _make_flashcard(
+            self.root, Flashcard.CardType.MULTIPLE_CHOICE, prompt='mc q', answer='',
+            options=[{'text': 'wrong', 'is_correct': False}, {'text': 'right', 'is_correct': True}],
+        )
+        self.typed = _make_flashcard(
+            self.root, Flashcard.CardType.TYPED_ANSWER, prompt='typed q', answer='Paris',
+            accepted_answers=['la ville lumiere'],
+        )
+        self.child_card = _make_flashcard(self.child, prompt='child q', answer='child a')
+
+    # -- helpers ---------------------------------------------------------
+
+    def _post(self, path, data=None, headers=None):
+        return self.client.post(
+            f'/api/flashcards/{path}', data or {}, content_type='application/json',
+            **(headers or self.headers),
+        )
+
+    def _get(self, path, headers=None):
+        return self.client.get(f'/api/flashcards/{path}', **(headers or self.headers))
+
+    def _create_selected(self, cards=None, minutes=None, headers=None):
+        cards = cards or [self.basic, self.mc, self.typed]
+        body = {'mode': 'selected', 'card_ids': [c.id for c in cards]}
+        if minutes is not None:
+            body['time_limit_minutes'] = minutes
+        return self._post('exams/', body, headers)
+
+    def _question(self, exam_id, card):
+        return ExamQuestion.objects.get(exam_id=exam_id, flashcard=card)
+
+    def _answer(self, exam_id, card, **fields):
+        question = self._question(exam_id, card)
+        return self._post(f'exams/{exam_id}/answer/', {'question_id': question.id, **fields})
+
+    # -- creation --------------------------------------------------------
+
+    def test_random_uses_only_direct_cards_of_the_given_collections(self):
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [self.child.id]})
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.json()['total'], 1)
+        self.assertEqual(response.json()['source_labels'], ['Child'])
+
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [self.root.id, self.child.id]})
+        self.assertEqual(response.json()['total'], 4)
+
+    def test_random_count_is_clamped_to_the_pool(self):
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [self.root.id], 'count': 50})
+        self.assertEqual(response.json()['total'], 3)
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [self.root.id], 'count': 2})
+        self.assertEqual(response.json()['total'], 2)
+
+    def test_random_null_count_takes_the_whole_pool(self):
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [self.root.id], 'count': None})
+        self.assertEqual(response.json()['total'], 3)
+
+    def test_selected_dedupes_and_keeps_order(self):
+        response = self._post('exams/', {
+            'mode': 'selected', 'card_ids': [self.typed.id, self.basic.id, self.typed.id],
+        })
+        self.assertEqual(response.status_code, 201)
+        prompts = [q['prompt'] for q in response.json()['questions']]
+        self.assertEqual(prompts, ['typed q', 'basic q'])
+
+    def test_foreign_collection_or_card_is_404(self):
+        theirs = _make_collection(self.other, 'Theirs')
+        their_card = _make_flashcard(theirs)
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [theirs.id]})
+        self.assertEqual(response.status_code, 404)
+        response = self._post('exams/', {'mode': 'selected', 'card_ids': [self.basic.id, their_card.id]})
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(Exam.objects.count(), 0)
+
+    def test_empty_pool_too_many_cards_and_bad_time_limit(self):
+        empty = _make_collection(self.user, 'Empty')
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [empty.id]})
+        self.assertEqual((response.status_code, response.json()['code']), (400, 'empty_pool'))
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': []})
+        self.assertEqual(response.json()['code'], 'empty_pool')
+        response = self._post('exams/', {'mode': 'selected', 'card_ids': []})
+        self.assertEqual(response.json()['code'], 'empty_pool')
+
+        response = self._post('exams/', {'mode': 'random', 'collection_ids': [self.root.id], 'count': 201})
+        self.assertEqual((response.status_code, response.json()['code']), (400, 'too_many_cards'))
+        response = self._post('exams/', {'mode': 'selected', 'card_ids': list(range(1, 202))})
+        self.assertEqual(response.json()['code'], 'too_many_cards')
+
+        for bad in (0, 301, -5):
+            response = self._create_selected(minutes=bad)
+            self.assertEqual((response.status_code, response.json()['code']), (400, 'invalid_time_limit'))
+
+    def test_time_limit_sets_ends_at(self):
+        response = self._create_selected(minutes=15)
+        body = response.json()
+        self.assertEqual(body['time_limit_seconds'], 900)
+        self.assertIsNotNone(body['ends_at'])
+        self.assertIsNotNone(body['server_now'])
+        untimed = self._create_selected().json()
+        self.assertIsNone(untimed['time_limit_seconds'])
+        self.assertIsNone(untimed['ends_at'])
+
+    def test_in_progress_cap(self):
+        for _ in range(10):
+            self.assertEqual(self._create_selected().status_code, 201)
+        response = self._create_selected()
+        self.assertEqual((response.status_code, response.json()['code']), (409, 'too_many_in_progress'))
+        # A finished exam frees a slot.
+        first = Exam.objects.filter(user=self.user).first()
+        self._post(f'exams/{first.id}/finish/')
+        self.assertEqual(self._create_selected().status_code, 201)
+
+    def test_retake_uses_only_incorrect_and_unanswered_and_skips_deleted(self):
+        exam_id = self._create_selected([self.basic, self.mc, self.typed, self.child_card]).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)       # correct
+        self._answer(exam_id, self.mc, selected_option=0)          # incorrect
+        # typed left unanswered, child_card unanswered then deleted
+        self.child_card.delete()
+        self._post(f'exams/{exam_id}/finish/')
+
+        response = self._post('exams/', {'mode': 'retake', 'exam_id': exam_id})
+        self.assertEqual(response.status_code, 201)
+        body = response.json()
+        self.assertEqual(sorted(q['prompt'] for q in body['questions']), ['mc q', 'typed q'])
+        self.assertEqual(body['skipped_deleted'], 1)
+
+    def test_retake_with_nothing_missed_or_foreign_exam(self):
+        exam_id = self._create_selected([self.basic]).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)
+        self._post(f'exams/{exam_id}/finish/')
+        response = self._post('exams/', {'mode': 'retake', 'exam_id': exam_id})
+        self.assertEqual((response.status_code, response.json()['code']), (400, 'no_cards'))
+        response = self._post('exams/', {'mode': 'retake', 'exam_id': exam_id}, self.other_headers)
+        self.assertEqual(response.status_code, 404)
+
+    # -- what the player is allowed to see -------------------------------
+
+    def test_in_progress_detail_never_leaks_answers(self):
+        exam_id = self._create_selected().json()['id']
+        body = self._get(f'exams/{exam_id}/').json()
+        by_type = {q['card_type']: q for q in body['questions']}
+
+        mc = by_type['multiple_choice']
+        self.assertEqual(mc['options'], ['wrong', 'right'])
+        self.assertIsNone(mc['answer'])
+        typed = by_type['typed_answer']
+        self.assertIsNone(typed['answer'])
+        # Basic cards must carry the back for self-grading.
+        self.assertEqual(by_type['basic']['answer'], 'basic a')
+
+        raw = self._get(f'exams/{exam_id}/').content.decode()
+        for forbidden in ('is_correct', 'accepted_answers', 'la ville lumiere', 'Paris'):
+            self.assertNotIn(forbidden, raw)
+
+    def test_answer_response_never_reveals_correctness(self):
+        exam_id = self._create_selected().json()['id']
+        body = self._answer(exam_id, self.mc, selected_option=1).json()
+        self.assertNotIn('correct', body)
+        self.assertNotIn('is_correct', body)
+        self.assertEqual(body['answered_count'], 1)
+        self.assertIn('server_now', body)
+
+    def test_other_user_gets_404_everywhere(self):
+        exam_id = self._create_selected().json()['id']
+        question = ExamQuestion.objects.filter(exam_id=exam_id).first()
+        for method, path, data in (
+            ('get', f'exams/{exam_id}/', None),
+            ('get', f'exams/{exam_id}/status/', None),
+            ('post', f'exams/{exam_id}/answer/', {'question_id': question.id, 'self_correct': True}),
+            ('post', f'exams/{exam_id}/finish/', {}),
+            ('delete', f'exams/{exam_id}/', None),
+        ):
+            response = getattr(self.client, method)(
+                f'/api/flashcards/{path}', *( [data] if data is not None else []),
+                **({'content_type': 'application/json'} if data is not None else {}),
+                **self.other_headers,
+            )
+            self.assertEqual(response.status_code, 404, path)
+        self.assertEqual(self._get('exams/', self.other_headers).json(), [])
+
+    # -- grading ---------------------------------------------------------
+
+    def test_multiple_choice_grading(self):
+        exam_id = self._create_selected().json()['id']
+        self._answer(exam_id, self.mc, selected_option=1)
+        self.assertTrue(self._question(exam_id, self.mc).is_correct)
+        self._answer(exam_id, self.mc, selected_option=0)
+        self.assertFalse(self._question(exam_id, self.mc).is_correct)
+
+    def test_typed_answer_grading_matches_review_rules(self):
+        exam_id = self._create_selected().json()['id']
+        for submitted, expected in (
+            ('  PARIS ', True), ('paris', True), ('La  Ville   Lumiere', True), ('london', False),
+        ):
+            self._answer(exam_id, self.typed, submitted_answer=submitted)
+            self.assertEqual(self._question(exam_id, self.typed).is_correct, expected, submitted)
+
+    def test_basic_self_grading(self):
+        exam_id = self._create_selected().json()['id']
+        self._answer(exam_id, self.basic, self_correct=False)
+        self.assertIs(self._question(exam_id, self.basic).is_correct, False)
+        self._answer(exam_id, self.basic, self_correct=True)
+        self.assertIs(self._question(exam_id, self.basic).is_correct, True)
+
+    def test_answer_can_be_changed_before_finish_and_is_returned_on_reload(self):
+        exam_id = self._create_selected().json()['id']
+        self._answer(exam_id, self.mc, selected_option=0)
+        self._answer(exam_id, self.mc, selected_option=1)
+        body = self._get(f'exams/{exam_id}/').json()
+        mc = next(q for q in body['questions'] if q['card_type'] == 'multiple_choice')
+        self.assertEqual(mc['selected_option'], 1)
+        self.assertTrue(mc['answered'])
+        self.assertEqual(body['answered_count'], 1)
+
+    def test_invalid_answers_are_400(self):
+        exam_id = self._create_selected().json()['id']
+        cases = (
+            (self.mc, {'selected_option': 5}),
+            (self.mc, {'submitted_answer': 'x'}),
+            (self.mc, {}),
+            (self.typed, {'submitted_answer': '   '}),
+            (self.typed, {'submitted_answer': 'x' * 1001}),
+            (self.typed, {'selected_option': 0}),
+            (self.basic, {'selected_option': 0}),
+            (self.basic, {'self_correct': True, 'submitted_answer': 'x'}),
+        )
+        for card, fields in cases:
+            response = self._answer(exam_id, card, **fields)
+            self.assertEqual(response.status_code, 400, (card.card_type, fields))
+        self.assertFalse(ExamQuestion.objects.filter(exam_id=exam_id, answered_at__isnull=False).exists())
+
+    def test_question_from_another_exam_is_404(self):
+        first = self._create_selected([self.basic]).json()['id']
+        second = self._create_selected([self.mc]).json()['id']
+        foreign_question = ExamQuestion.objects.get(exam_id=second)
+        response = self._post(f'exams/{first}/answer/', {'question_id': foreign_question.id, 'self_correct': True})
+        self.assertEqual(response.status_code, 404)
+
+    # -- time ------------------------------------------------------------
+
+    def test_answers_after_the_deadline_are_flagged_late_with_a_grace_window(self):
+        exam_id = self._create_selected(minutes=1).json()['id']
+        # 1s past the deadline: inside the 3s grace window, still on time.
+        Exam.objects.filter(pk=exam_id).update(started_at=timezone.now() - timedelta(seconds=61))
+        body = self._answer(exam_id, self.basic, self_correct=True).json()
+        self.assertFalse(body['after_time'])
+        # Well past the deadline: late.
+        Exam.objects.filter(pk=exam_id).update(started_at=timezone.now() - timedelta(seconds=120))
+        body = self._answer(exam_id, self.mc, selected_option=1).json()
+        self.assertTrue(body['after_time'])
+        # Re-answering the on-time card now makes it late (evaluated on every write).
+        self._answer(exam_id, self.basic, self_correct=True)
+        self.assertTrue(self._question(exam_id, self.basic).answered_after_time)
+
+    def test_untimed_exam_is_never_late(self):
+        exam_id = self._create_selected().json()['id']
+        Exam.objects.filter(pk=exam_id).update(started_at=timezone.now() - timedelta(days=3))
+        self.assertFalse(self._answer(exam_id, self.basic, self_correct=True).json()['after_time'])
+
+    def test_status_endpoint(self):
+        exam_id = self._create_selected(minutes=10).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)
+        body = self._get(f'exams/{exam_id}/status/').json()
+        self.assertEqual(body['status'], 'in_progress')
+        self.assertEqual(body['answered_count'], 1)
+        self.assertIsNotNone(body['ends_at'])
+        self.assertIsNotNone(body['server_now'])
+
+    # -- finishing and results -------------------------------------------
+
+    def test_finish_summary_counts_and_score(self):
+        exam_id = self._create_selected([self.basic, self.mc, self.typed, self.child_card]).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)
+        self._answer(exam_id, self.mc, selected_option=0)
+        self._answer(exam_id, self.typed, submitted_answer='paris')
+        # child_card left unanswered
+        body = self._post(f'exams/{exam_id}/finish/').json()
+
+        self.assertEqual(body['status'], 'completed')
+        summary = body['summary']
+        self.assertEqual(summary['total'], 4)
+        self.assertEqual(summary['correct'], 2)
+        self.assertEqual(summary['incorrect'], 1)
+        self.assertEqual(summary['unanswered'], 1)
+        self.assertEqual(summary['correct_in_time'], 2)
+        self.assertEqual(summary['score_percent'], 50)
+        self.assertFalse(summary['timed_out'])
+        self.assertEqual(summary['unanswered_when_time_ran_out'], 0)
+
+        # Results reveal everything.
+        mc = next(q for q in body['questions'] if q['card_type'] == 'multiple_choice')
+        self.assertTrue(mc['options'][1]['is_correct'])
+        self.assertIs(mc['is_correct'], False)
+        # Detail of a completed exam has the same shape as the finish response.
+        detail = self._get(f'exams/{exam_id}/').json()
+        self.assertEqual(detail['summary'], summary)
+
+    def test_timed_out_summary_splits_late_and_never_answered(self):
+        exam_id = self._create_selected([self.basic, self.mc, self.typed], minutes=10).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)        # on time
+        Exam.objects.filter(pk=exam_id).update(started_at=timezone.now() - timedelta(minutes=15))
+        self._answer(exam_id, self.mc, selected_option=1)           # late, correct
+        # typed never answered
+        summary = self._post(f'exams/{exam_id}/finish/').json()['summary']
+
+        self.assertTrue(summary['timed_out'])
+        self.assertEqual(summary['correct'], 2)
+        self.assertEqual(summary['correct_in_time'], 1)
+        self.assertEqual(summary['answered_after_time'], {'count': 1, 'correct': 1})
+        self.assertEqual(summary['unanswered'], 1)
+        # Still open when the clock hit zero: the late one plus the never-answered one.
+        self.assertEqual(summary['unanswered_when_time_ran_out'], 2)
+        self.assertEqual(summary['score_percent'], 67)
+
+    def test_finish_is_idempotent_and_locks_answers(self):
+        exam_id = self._create_selected([self.basic]).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)
+        first = self._post(f'exams/{exam_id}/finish/').json()
+        finished_at = Exam.objects.get(pk=exam_id).finished_at
+        second = self._post(f'exams/{exam_id}/finish/').json()
+        self.assertEqual(Exam.objects.get(pk=exam_id).finished_at, finished_at)
+        self.assertEqual(first['summary'], second['summary'])
+
+        response = self._answer(exam_id, self.basic, self_correct=False)
+        self.assertEqual((response.status_code, response.json()['code']), (409, 'exam_completed'))
+        self.assertIs(self._question(exam_id, self.basic).is_correct, True)
+
+    def test_results_survive_card_edit_and_deletion(self):
+        exam_id = self._create_selected([self.basic, self.typed]).json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)
+        self._post(f'exams/{exam_id}/finish/')
+
+        self.basic.prompt = 'edited later'
+        self.basic.save()
+        self.typed.delete()
+
+        questions = {q['card_type']: q for q in self._get(f'exams/{exam_id}/').json()['questions']}
+        self.assertEqual(questions['basic']['prompt'], 'basic q')
+        self.assertFalse(questions['basic']['card_deleted'])
+        self.assertEqual(questions['typed_answer']['prompt'], 'typed q')
+        self.assertEqual(questions['typed_answer']['answer'], 'Paris')
+        self.assertTrue(questions['typed_answer']['card_deleted'])
+
+    # -- isolation from spaced repetition --------------------------------
+
+    def test_exams_never_touch_review_state_log_or_study_days(self):
+        before = (ReviewState.objects.count(), ReviewLog.objects.count(), StudyDay.objects.count())
+        exam_id = self._create_selected().json()['id']
+        self._answer(exam_id, self.basic, self_correct=True)
+        self._answer(exam_id, self.mc, selected_option=1)
+        self._answer(exam_id, self.typed, submitted_answer='paris')
+        self._post(f'exams/{exam_id}/finish/')
+        self._post('exams/', {'mode': 'retake', 'exam_id': exam_id})
+        after = (ReviewState.objects.count(), ReviewLog.objects.count(), StudyDay.objects.count())
+        self.assertEqual(before, after)
+        self.assertEqual(self._get('goals/summary/').json()['cards_studied_today'], 0)
+
+    # -- listing and deletion --------------------------------------------
+
+    def test_list_returns_counts_newest_first_with_summary_only_when_completed(self):
+        done = self._create_selected([self.basic, self.mc]).json()['id']
+        self._answer(done, self.basic, self_correct=True)
+        self._post(f'exams/{done}/finish/')
+        running = self._create_selected([self.typed]).json()['id']
+
+        rows = self._get('exams/').json()
+        self.assertEqual([row['id'] for row in rows], [running, done])
+        self.assertIsNone(rows[0]['summary'])
+        self.assertEqual(rows[0]['total'], 1)
+        self.assertEqual(rows[1]['summary']['score_percent'], 50)
+        self.assertEqual(rows[1]['answered_count'], 1)
+        self.assertNotIn('questions', rows[0])
+
+        completed_only = self._get('exams/?status=completed').json()
+        self.assertEqual([row['id'] for row in completed_only], [done])
+        self.assertEqual(len(self._get('exams/?limit=1').json()), 1)
+
+    def test_list_query_count_does_not_grow_with_exams(self):
+        for _ in range(5):
+            self._create_selected()
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        with CaptureQueriesContext(connection) as many:
+            self._get('exams/')
+        Exam.objects.exclude(pk=Exam.objects.first().pk).delete()
+        with CaptureQueriesContext(connection) as one:
+            self._get('exams/')
+        self.assertEqual(len(many), len(one))
+
+    def test_detail_query_count_does_not_grow_with_questions(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        small = self._create_selected([self.basic]).json()['id']
+        extra = [_make_flashcard(self.root, prompt=f'extra {i}') for i in range(15)]
+        large = self._create_selected([self.basic, *extra]).json()['id']
+        with CaptureQueriesContext(connection) as small_queries:
+            self._get(f'exams/{small}/')
+        with CaptureQueriesContext(connection) as large_queries:
+            self._get(f'exams/{large}/')
+        self.assertEqual(len(small_queries), len(large_queries))
+
+    def test_delete(self):
+        exam_id = self._create_selected().json()['id']
+        self.assertEqual(self.client.delete(f'/api/flashcards/exams/{exam_id}/', **self.headers).status_code, 204)
+        self.assertFalse(Exam.objects.filter(pk=exam_id).exists())
+        self.assertEqual(self._get(f'exams/{exam_id}/').status_code, 404)
+        # Cards are untouched.
+        self.assertTrue(Flashcard.objects.filter(pk=self.basic.pk).exists())

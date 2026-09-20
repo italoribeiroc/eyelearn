@@ -242,6 +242,11 @@ REST_FRAMEWORK = {
         # AI_GENERATION_BATCH_SIZE continuation calls (20) on its own.
         'ai_flashcard_generation_batch': '200/hour',
         'ai_source_document': '60/hour',
+        # Exams: creating one is cheap but bounded; answering is the hot path
+        # (a fast test-taker saves one answer every second or two), so it gets
+        # its own scope instead of sharing the 120/min 'user' one.
+        'exam_create': '20/min',
+        'exam_answer': '240/min',
     },
     'DEFAULT_RENDERER_CLASSES': (
         ['rest_framework.renderers.JSONRenderer', 'rest_framework.renderers.BrowsableAPIRenderer']
