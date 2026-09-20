@@ -1,6 +1,7 @@
 from datetime import timedelta
 
 from django.db import transaction
+from django.db.models import Count, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -15,6 +16,8 @@ from .ai_providers import pop_last_provider_used
 from .models import (
     Collection,
     CollectionGoal,
+    Exam,
+    ExamQuestion,
     Flashcard,
     FlashcardGenerationDraft,
     FlashcardMedia,
@@ -26,6 +29,8 @@ from .serializers import (
     AiRemoveCardsRequestSerializer,
     CollectionGoalSerializer,
     CollectionSerializer,
+    ExamAnswerSerializer,
+    ExamCreateSerializer,
     FlashcardMediaSerializer,
     FlashcardSerializer,
     GenerationSourceDocumentDetailSerializer,
@@ -36,6 +41,8 @@ from .serializers import (
     SourceDocumentConfirmSerializer,
     SourceDocumentUpdateTextSerializer,
     SourceDocumentUploadURLRequestSerializer,
+    serialize_exam_detail,
+    serialize_exam_row,
 )
 from .services import (
     AiFlashcardGenerationService,
@@ -46,6 +53,10 @@ from .services import (
     CollectionService,
     CrossOwnerParentError,
     DocumentExtractionFailedError,
+    ExamConflictError,
+    ExamNotFoundError,
+    ExamService,
+    ExamValidationError,
     FlashcardLimitError,
     FlashcardService,
     GoalService,
@@ -668,3 +679,159 @@ def discard_draft(request, draft_id):
         return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
     return Response({'status': draft.status})
+
+
+class ExamCreateThrottle(UserRateThrottle):
+    """Applies only to POST so listing exams isn't counted against creation."""
+    scope = 'exam_create'
+
+    def allow_request(self, request, view):
+        if request.method != 'POST':
+            return True
+        return super().allow_request(request, view)
+
+
+class ExamAnswerThrottle(UserRateThrottle):
+    scope = 'exam_answer'
+
+
+EXAM_LIST_DEFAULT_LIMIT = 20
+EXAM_LIST_MAX_LIMIT = 50
+
+
+def _user_exam_or_404(user, exam_id):
+    return get_object_or_404(Exam, pk=exam_id, user=user)
+
+
+def _exam_with_questions(exam_id):
+    """One exam with its questions, cards and media loaded in a fixed number
+    of queries regardless of exam size."""
+    return Exam.objects.prefetch_related(
+        Prefetch(
+            'questions',
+            queryset=ExamQuestion.objects.select_related('flashcard').prefetch_related('flashcard__media'),
+        ),
+    ).get(pk=exam_id)
+
+
+def _annotated_exams(queryset):
+    return queryset.annotate(
+        total_questions=Count('questions'),
+        answered_questions=Count('questions', filter=Q(questions__answered_at__isnull=False)),
+        correct_questions=Count('questions', filter=Q(questions__is_correct=True)),
+        late_questions=Count('questions', filter=Q(questions__answered_after_time=True)),
+        late_correct_questions=Count(
+            'questions', filter=Q(questions__answered_after_time=True, questions__is_correct=True),
+        ),
+    )
+
+
+def _exam_error_response(exc):
+    if isinstance(exc, ExamNotFoundError):
+        return Response({'detail': str(exc), 'code': 'not_found'}, status=status.HTTP_404_NOT_FOUND)
+    status_code = status.HTTP_409_CONFLICT if isinstance(exc, ExamConflictError) else status.HTTP_400_BAD_REQUEST
+    return Response({'detail': str(exc), 'code': exc.code}, status=status_code)
+
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([UserRateThrottle, ExamCreateThrottle])
+def exam_list(request):
+    if request.method == 'GET':
+        queryset = Exam.objects.filter(user=request.user)
+        status_filter = request.query_params.get('status')
+        if status_filter in Exam.Status.values:
+            queryset = queryset.filter(status=status_filter)
+        try:
+            limit = int(request.query_params.get('limit', EXAM_LIST_DEFAULT_LIMIT))
+        except ValueError:
+            limit = EXAM_LIST_DEFAULT_LIMIT
+        limit = max(1, min(limit, EXAM_LIST_MAX_LIMIT))
+        # Explicit order_by: Meta.ordering is ignored on GROUP BY (annotated) queries.
+        exams = _annotated_exams(queryset).order_by('-started_at', '-id')[:limit]
+        return Response([serialize_exam_row(exam) for exam in exams])
+
+    serializer = ExamCreateSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    try:
+        exam, skipped_deleted = ExamService().create(
+            user=request.user,
+            mode=data['mode'],
+            collection_ids=data.get('collection_ids'),
+            count=data.get('count'),
+            card_ids=data.get('card_ids'),
+            exam_id=data.get('exam_id'),
+            time_limit_minutes=data.get('time_limit_minutes'),
+        )
+    except (ExamValidationError, ExamNotFoundError) as exc:
+        return _exam_error_response(exc)
+
+    payload = serialize_exam_detail(_exam_with_questions(exam.id))
+    payload['skipped_deleted'] = skipped_deleted
+    return Response(payload, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET', 'DELETE'])
+@permission_classes([IsAuthenticated])
+def exam_detail(request, exam_id):
+    exam = _user_exam_or_404(request.user, exam_id)
+
+    if request.method == 'DELETE':
+        exam.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    return Response(serialize_exam_detail(_exam_with_questions(exam.id)))
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def exam_status(request, exam_id):
+    exam = _user_exam_or_404(request.user, exam_id)
+    return Response({
+        'status': exam.status,
+        'ends_at': exam.ends_at,
+        'finished_at': exam.finished_at,
+        'server_now': timezone.now(),
+        'answered_count': exam.questions.filter(answered_at__isnull=False).count(),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@throttle_classes([ExamAnswerThrottle])
+def exam_answer(request, exam_id):
+    exam = _user_exam_or_404(request.user, exam_id)
+
+    serializer = ExamAnswerSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    data = serializer.validated_data
+
+    try:
+        question, answered_count = ExamService().answer(
+            exam=exam,
+            question_id=data['question_id'],
+            selected_option=data.get('selected_option'),
+            submitted_answer=data.get('submitted_answer'),
+            self_correct=data.get('self_correct'),
+        )
+    except (ExamValidationError, ExamNotFoundError) as exc:
+        return _exam_error_response(exc)
+
+    # Deliberately no `correct`: the user finds out at the end, not mid-exam.
+    return Response({
+        'question_id': question.id,
+        'answered': True,
+        'answered_count': answered_count,
+        'after_time': question.answered_after_time,
+        'server_now': timezone.now(),
+    })
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def exam_finish(request, exam_id):
+    exam = _user_exam_or_404(request.user, exam_id)
+    ExamService().finish(exam=exam)
+    return Response(serialize_exam_detail(_exam_with_questions(exam.id)))

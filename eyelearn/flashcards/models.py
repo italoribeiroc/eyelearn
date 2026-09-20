@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.conf import settings
 from django.db import models
 
@@ -251,3 +253,81 @@ class ReviewLog(models.Model):
 
     def __str__(self):
         return f'{self.review_state_id} rating={self.rating} at={self.reviewed_at}'
+
+
+class Exam(models.Model):
+    """A saved, self-contained test over a chosen set of flashcards.
+
+    Deliberately separate from spaced repetition: taking an exam never
+    creates or changes a ReviewState/ReviewLog/StudyDay, so it can't affect
+    scheduling, the streak, or goal progress. Each ExamQuestion snapshots its
+    card's text so results stay readable after the card is edited or deleted.
+    """
+
+    class Status(models.TextChoices):
+        IN_PROGRESS = 'in_progress', 'In progress'
+        COMPLETED = 'completed', 'Completed'
+
+    class Mode(models.TextChoices):
+        RANDOM = 'random', 'Random cards'
+        SELECTED = 'selected', 'Selected cards'
+        RETAKE = 'retake', 'Retake missed cards'
+
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='exams')
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.IN_PROGRESS)
+    mode = models.CharField(max_length=10, choices=Mode.choices)
+    # Null means untimed.
+    time_limit_seconds = models.PositiveIntegerField(null=True, blank=True)
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    # Collection names at creation time, for display only (collections can be
+    # renamed or deleted afterwards).
+    source_labels = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['user', '-started_at'])]
+        ordering = ['-started_at']
+
+    def __str__(self):
+        return f'{self.user_id}:exam {self.pk} ({self.status})'
+
+    @property
+    def ends_at(self):
+        if self.time_limit_seconds is None:
+            return None
+        return self.started_at + timedelta(seconds=self.time_limit_seconds)
+
+
+class ExamQuestion(models.Model):
+    exam = models.ForeignKey(Exam, on_delete=models.CASCADE, related_name='questions')
+    # SET_NULL so deleting a card keeps the exam's history intact.
+    flashcard = models.ForeignKey(
+        Flashcard, on_delete=models.SET_NULL, null=True, blank=True, related_name='exam_questions',
+    )
+    position = models.PositiveIntegerField()
+
+    # Snapshot of the card at exam creation.
+    card_type = models.CharField(max_length=20, choices=Flashcard.CardType.choices)
+    prompt = models.TextField()
+    answer = models.TextField(blank=True, default='')
+    options = models.JSONField(blank=True, default=list)
+    accepted_answers = models.JSONField(blank=True, default=list)
+
+    # The user's response: only the field matching card_type is used.
+    selected_option = models.PositiveIntegerField(null=True, blank=True)
+    submitted_answer = models.TextField(blank=True, default='')
+    self_correct = models.BooleanField(null=True, blank=True)
+    # Null means never answered.
+    is_correct = models.BooleanField(null=True, blank=True)
+    answered_at = models.DateTimeField(null=True, blank=True)
+    # True when the (latest) answer was saved after the time limit ran out.
+    answered_after_time = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ['position']
+        constraints = [
+            models.UniqueConstraint(fields=['exam', 'position'], name='unique_exam_question_position'),
+        ]
+
+    def __str__(self):
+        return f'exam {self.exam_id} #{self.position}'

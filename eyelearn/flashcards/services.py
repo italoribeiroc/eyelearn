@@ -1,5 +1,6 @@
 import logging
 import math
+import random
 import unicodedata
 from datetime import timedelta
 
@@ -14,6 +15,8 @@ from . import ai_generation, document_extraction, storage
 from .models import (
     Collection,
     CollectionGoal,
+    Exam,
+    ExamQuestion,
     Flashcard,
     FlashcardGenerationDraft,
     FlashcardMedia,
@@ -90,6 +93,23 @@ class NoReviewToUndoError(Exception):
     """Raised when there's no recent-enough review left to undo for a card."""
 
 
+class ExamValidationError(Exception):
+    """A bad exam request. `code` is a stable machine-readable string the
+    frontend can branch on; `str(exc)` is the human-readable message."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class ExamConflictError(ExamValidationError):
+    """A well-formed request that conflicts with the exam's current state."""
+
+
+class ExamNotFoundError(Exception):
+    """A referenced collection, card, exam, or question doesn't exist (or isn't the caller's)."""
+
+
 ALLOWED_CONTENT_TYPES = {
     FlashcardMedia.MediaType.IMAGE: {'image/png', 'image/jpeg', 'image/webp', 'image/gif'},
     FlashcardMedia.MediaType.AUDIO: {'audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/wav'},
@@ -106,6 +126,13 @@ MAX_SIZE_BYTES = {
 def normalize_answer(text):
     text = unicodedata.normalize('NFKC', text or '')
     return ' '.join(text.strip().lower().split())
+
+
+def check_multiple_choice(options, selected_option):
+    options = options or []
+    if selected_option is None or not (0 <= selected_option < len(options)):
+        return False
+    return bool(options[selected_option].get('is_correct'))
 
 
 def check_typed_answer(flashcard, submitted):
@@ -853,10 +880,7 @@ class ReviewService:
         return review_state
 
     def _check_multiple_choice(self, flashcard, selected_option):
-        options = flashcard.options or []
-        if selected_option is None or not (0 <= selected_option < len(options)):
-            return False
-        return bool(options[selected_option].get('is_correct'))
+        return check_multiple_choice(flashcard.options, selected_option)
 
     def _scheduler(self):
         return fsrs.Scheduler(
@@ -999,3 +1023,242 @@ class StreakService:
             })
             cursor += timedelta(days=1)
         return days
+
+
+MAX_EXAM_CARDS = 200
+MAX_EXAM_MINUTES = 300
+MAX_IN_PROGRESS_EXAMS = 10
+MAX_EXAM_ANSWER_LENGTH = 1000
+# An answer saved within this many seconds after the deadline still counts as
+# in time: absorbs request latency and small client/server clock differences
+# for a user who answered right at zero.
+EXAM_ANSWER_GRACE_SECONDS = 3
+
+
+def build_exam_summary(exam, *, total, correct, answered, late, late_correct):
+    """Score summary for a completed exam from plain counts (so both the
+    detail view, which counts in Python, and the list view, which counts via
+    queryset annotations, share one definition)."""
+    unanswered = total - answered
+    timed_out = bool(
+        exam.time_limit_seconds is not None and exam.finished_at is not None and exam.finished_at > exam.ends_at
+    )
+    return {
+        'total': total,
+        'correct': correct,
+        'incorrect': answered - correct,
+        'unanswered': unanswered,
+        'correct_in_time': correct - late_correct,
+        'answered_after_time': {'count': late, 'correct': late_correct},
+        # Everything still open when the clock hit zero: answered late plus never answered.
+        'unanswered_when_time_ran_out': (late + unanswered) if timed_out else 0,
+        'timed_out': timed_out,
+        'time_taken_seconds': (
+            int((exam.finished_at - exam.started_at).total_seconds()) if exam.finished_at else None
+        ),
+        # Unanswered questions count as wrong.
+        'score_percent': round(correct * 100 / total) if total else 0,
+    }
+
+
+class ExamService:
+    """Saved exams over a set of flashcards.
+
+    Never touches ReviewState/ReviewLog/StudyDay: an exam is a test, not a
+    study session, so it must not move FSRS scheduling, the streak, or goals.
+    """
+
+    def assert_can_create(self, *, user):
+        # Single seam for a future Pro gate on exams (not gated yet).
+        in_progress = Exam.objects.filter(user=user, status=Exam.Status.IN_PROGRESS).count()
+        if in_progress >= MAX_IN_PROGRESS_EXAMS:
+            raise ExamConflictError(
+                'too_many_in_progress',
+                f'You already have {MAX_IN_PROGRESS_EXAMS} exams in progress. Finish or delete one first.',
+            )
+
+    def create(self, *, user, mode, collection_ids=None, count=None, card_ids=None, exam_id=None,
+               time_limit_minutes=None):
+        """Returns (exam, skipped_deleted)."""
+        time_limit_seconds = self._validate_time_limit(time_limit_minutes)
+        self.assert_can_create(user=user)
+
+        skipped_deleted = 0
+        if mode == Exam.Mode.RANDOM:
+            cards, labels = self._pick_random_cards(user=user, collection_ids=collection_ids, count=count)
+        elif mode == Exam.Mode.SELECTED:
+            cards, labels = self._pick_selected_cards(user=user, card_ids=card_ids)
+        elif mode == Exam.Mode.RETAKE:
+            cards, labels, skipped_deleted = self._pick_missed_cards(user=user, exam_id=exam_id)
+        else:
+            raise ExamValidationError('invalid_mode', 'Unknown exam mode.')
+
+        with transaction.atomic():
+            exam = Exam.objects.create(
+                user=user, mode=mode, time_limit_seconds=time_limit_seconds, source_labels=labels,
+            )
+            ExamQuestion.objects.bulk_create([
+                ExamQuestion(
+                    exam=exam, flashcard=card, position=position, card_type=card.card_type,
+                    prompt=card.prompt, answer=card.answer, options=card.options,
+                    accepted_answers=card.accepted_answers,
+                )
+                for position, card in enumerate(cards)
+            ])
+        return exam, skipped_deleted
+
+    def answer(self, *, exam, question_id, selected_option=None, submitted_answer=None, self_correct=None):
+        """Saves (or replaces) the answer to one question. Returns
+        (question, answered_count). Correctness is stored but deliberately
+        never handed back to the caller until the exam is finished."""
+        with transaction.atomic():
+            # Lock + re-read so a concurrent finish() can't slip between the
+            # status check and the write.
+            locked = Exam.objects.select_for_update().get(pk=exam.pk)
+            if locked.status == Exam.Status.COMPLETED:
+                raise ExamConflictError('exam_completed', 'This exam is already finished.')
+
+            try:
+                question = locked.questions.get(pk=question_id)
+            except ExamQuestion.DoesNotExist:
+                raise ExamNotFoundError('Question not found in this exam.')
+
+            self._validate_answer_fields(
+                question, selected_option=selected_option, submitted_answer=submitted_answer,
+                self_correct=self_correct,
+            )
+
+            if question.card_type == Flashcard.CardType.MULTIPLE_CHOICE:
+                question.selected_option = selected_option
+                question.is_correct = check_multiple_choice(question.options, selected_option)
+            elif question.card_type == Flashcard.CardType.TYPED_ANSWER:
+                question.submitted_answer = submitted_answer.strip()
+                question.is_correct = check_typed_answer(question, submitted_answer)
+            else:
+                question.self_correct = self_correct
+                question.is_correct = self_correct
+
+            now = timezone.now()
+            question.answered_at = now
+            # Re-evaluated on every write, so changing an answer after the
+            # deadline makes it a late one.
+            ends_at = locked.ends_at
+            question.answered_after_time = bool(
+                ends_at is not None and now > ends_at + timedelta(seconds=EXAM_ANSWER_GRACE_SECONDS)
+            )
+            question.save()
+
+            answered_count = locked.questions.filter(answered_at__isnull=False).count()
+        return question, answered_count
+
+    def finish(self, *, exam):
+        """Idempotent: finishing an already-finished exam returns it unchanged."""
+        with transaction.atomic():
+            locked = Exam.objects.select_for_update().get(pk=exam.pk)
+            if locked.status == Exam.Status.IN_PROGRESS:
+                locked.status = Exam.Status.COMPLETED
+                locked.finished_at = timezone.now()
+                locked.save(update_fields=['status', 'finished_at'])
+        return locked
+
+    def build_summary(self, *, exam, questions):
+        answered = [q for q in questions if q.is_correct is not None]
+        late = [q for q in answered if q.answered_after_time]
+        return build_exam_summary(
+            exam,
+            total=len(questions),
+            correct=sum(1 for q in answered if q.is_correct),
+            answered=len(answered),
+            late=len(late),
+            late_correct=sum(1 for q in late if q.is_correct),
+        )
+
+    def _validate_time_limit(self, minutes):
+        if minutes is None:
+            return None
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not (1 <= minutes <= MAX_EXAM_MINUTES):
+            raise ExamValidationError(
+                'invalid_time_limit', f'Time limit must be between 1 and {MAX_EXAM_MINUTES} minutes.',
+            )
+        return minutes * 60
+
+    def _pick_random_cards(self, *, user, collection_ids, count):
+        ids = list(dict.fromkeys(collection_ids or []))
+        if not ids:
+            raise ExamValidationError('empty_pool', 'Choose at least one collection.')
+        collections = list(Collection.objects.filter(user=user, id__in=ids))
+        if len(collections) != len(ids):
+            raise ExamNotFoundError('Collection not found.')
+
+        if count is not None and count > MAX_EXAM_CARDS:
+            raise ExamValidationError('too_many_cards', f'An exam can have at most {MAX_EXAM_CARDS} cards.')
+        if count is not None and count < 1:
+            raise ExamValidationError('empty_pool', 'Choose at least one card.')
+
+        # Direct cards of exactly the chosen collections: the UI cascades a
+        # parent's check to its children, so nothing is inferred from the tree here.
+        pool_ids = list(Flashcard.objects.filter(collection__in=collections).values_list('id', flat=True))
+        if not pool_ids:
+            raise ExamValidationError('empty_pool', 'The selected collections have no flashcards.')
+
+        wanted = min(count if count is not None else MAX_EXAM_CARDS, len(pool_ids))
+        chosen_ids = random.sample(pool_ids, wanted)
+        by_id = Flashcard.objects.in_bulk(chosen_ids)
+        cards = [by_id[card_id] for card_id in chosen_ids]
+        return cards, sorted(collection.name for collection in collections)
+
+    def _pick_selected_cards(self, *, user, card_ids):
+        ids = list(dict.fromkeys(card_ids or []))
+        if not ids:
+            raise ExamValidationError('empty_pool', 'Choose at least one card.')
+        if len(ids) > MAX_EXAM_CARDS:
+            raise ExamValidationError('too_many_cards', f'An exam can have at most {MAX_EXAM_CARDS} cards.')
+        by_id = Flashcard.objects.select_related('collection').in_bulk(
+            Flashcard.objects.filter(id__in=ids, collection__user=user).values_list('id', flat=True),
+        )
+        if len(by_id) != len(ids):
+            raise ExamNotFoundError('Flashcard not found.')
+        cards = [by_id[card_id] for card_id in ids]
+        labels = sorted({card.collection.name for card in cards})
+        return cards, labels
+
+    def _pick_missed_cards(self, *, user, exam_id):
+        try:
+            source = Exam.objects.get(pk=exam_id, user=user)
+        except (Exam.DoesNotExist, TypeError, ValueError):
+            raise ExamNotFoundError('Exam not found.')
+        missed = list(
+            source.questions.exclude(is_correct=True).select_related('flashcard').order_by('position')
+        )
+        cards = [question.flashcard for question in missed if question.flashcard is not None]
+        skipped_deleted = len(missed) - len(cards)
+        if not cards:
+            raise ExamValidationError('no_cards', 'There are no missed cards left to retake.')
+        random.shuffle(cards)
+        return cards, list(source.source_labels), skipped_deleted
+
+    def _validate_answer_fields(self, question, *, selected_option, submitted_answer, self_correct):
+        provided = {
+            'selected_option': selected_option is not None,
+            'submitted_answer': submitted_answer is not None,
+            'self_correct': self_correct is not None,
+        }
+        if question.card_type == Flashcard.CardType.MULTIPLE_CHOICE:
+            expected = 'selected_option'
+        elif question.card_type == Flashcard.CardType.TYPED_ANSWER:
+            expected = 'submitted_answer'
+        else:
+            expected = 'self_correct'
+
+        if not provided[expected] or any(value for name, value in provided.items() if name != expected):
+            raise ExamValidationError('invalid_answer', f'Answer this question with only "{expected}".')
+
+        if expected == 'selected_option' and not (0 <= selected_option < len(question.options or [])):
+            raise ExamValidationError('invalid_answer', 'That option does not exist.')
+        if expected == 'submitted_answer':
+            if not submitted_answer.strip():
+                raise ExamValidationError('invalid_answer', 'The answer cannot be blank.')
+            if len(submitted_answer) > MAX_EXAM_ANSWER_LENGTH:
+                raise ExamValidationError(
+                    'invalid_answer', f'The answer is limited to {MAX_EXAM_ANSWER_LENGTH} characters.',
+                )
